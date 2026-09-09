@@ -1,0 +1,85 @@
+{
+    "name": "zef/framework",
+    "description": "Zef Framework monolith",
+    "type": "project",
+    "version": "v250B1",
+    "require": {
+        "php": ">=8.4",
+        "composer/semver": "^3.4",
+        "google/protobuf": "^5.36",
+        "psr/container": "^2.0",
+        "psr/event-dispatcher": "^1.0",
+        "psr/http-factory": "^1.1",
+        "psr/http-message": "^2.0",
+        "psr/http-server-handler": "^1.0",
+        "psr/http-server-middleware": "^1.0",
+        "psr/log": "^3.0",
+        "roadrunner-php/roadrunner-api-dto": "^1.15",
+        "spiral/core": "^3.17",
+        "spiral/goridge": "^4.2",
+        "spiral/hmvc": "^3.17",
+        "spiral/interceptors": "^3.17",
+        "spiral/logger": "^3.17",
+        "spiral/roadrunner": "^2025.1",
+        "spiral/roadrunner-cli": "^2.7",
+        "spiral/roadrunner-http": "^3.6",
+        "spiral/roadrunner-worker": "^3.6",
+        "spiral/security": "^3.17",
+        "spiral/tokenizer": "^3.17",
+        "symfony/console": "^7.0 || ^8.0",
+        "symfony/finder": "^7.0 || ^8.0",
+        "symfony/http-client": "^7.0 || ^8.0",
+        "symfony/yaml": "^7.0 || ^8.0"
+    },
+    "require-dev": {
+        "guzzlehttp/psr7": "^3.0",
+        "laminas/laminas-diactoros": "^3.0",
+        "league/event": "^3.0",
+        "monolog/monolog": "^3.0",
+        "nyholm/psr7": "^1.8",
+        "phpstan/phpstan": "^2.2",
+        "phpunit/phpunit": "^11.0 || ^12.0 || ^13.0",
+        "symfony/http-foundation": "^7.0 || ^8.0",
+        "symfony/psr-http-message-bridge": "^7.0 || ^8.0",
+        "twig/twig": "^3.0"
+    },
+    "replace": {
+        "psr/container-implementation": "*",
+        "psr/http-client-implementation": "*",
+        "psr/http-factory-implementation": "*",
+        "psr/http-message-implementation": "*",
+        "psr/http-server-handler-implementation": "*",
+        "psr/http-server-middleware-implementation": "*",
+        "psr/log-implementation": "*",
+        "psr/simple-cache-implementation": "*",
+        "psr/event-dispatcher-implementation": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Zef\\Framework\\": "src/Framework/",
+            "Zef\\App\\": "src/App/",
+            "Zef\\Module\\": "src/Module/",
+            "Zef\\Middleware\\": "src/Middleware/",
+            "Zef\\Plugin\\": "src/Plugin/",
+            "Zef\\Test\\": "src/Test/"
+        },
+
+        "exclude-from-classmap": []
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Zef\\Tests\\": "tests/"
+        },
+        "exclude-from-classmap": [
+            "tests/"
+        ]
+    },
+    "config": {
+        "sort-packages": true,
+        "preferred-install": {
+            "*": "dist"
+        },
+        "allow-plugins": {}
+    },
+    "license": "proprietary"
+}

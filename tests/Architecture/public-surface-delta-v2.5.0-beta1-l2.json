@@ -1,0 +1,26 @@
+{
+  "from": "2.5.0-beta1-m",
+  "to": "2.5.0-beta1-l2",
+  "added_classes": [
+    "CacheClockInterface",
+    "CacheInterface",
+    "CacheItem",
+    "CacheKeyNormalizerInterface",
+    "CacheSerializerInterface",
+    "CacheStoreInterface",
+    "DefaultCacheKeyNormalizer",
+    "InMemoryCache",
+    "InMemoryCacheStore",
+    "SystemCacheClock"
+  ],
+  "removed_classes": [],
+  "added_public_methods": [
+    "clear",
+    "delete",
+    "isExpired",
+    "normalize",
+    "nowUnixNano",
+    "set"
+  ],
+  "removed_public_methods": []
+}

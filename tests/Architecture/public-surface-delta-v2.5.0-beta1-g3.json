@@ -1,0 +1,11 @@
+{
+  "added_classes": [
+    "LiveHandler",
+    "ReadyHandler"
+  ],
+  "added_public_methods": [],
+  "from": "2.5.0-beta1-l2",
+  "removed_classes": [],
+  "removed_public_methods": [],
+  "to": "2.5.0-beta1-g3"
+}

@@ -1,0 +1,22 @@
+{
+  "from": "2.5.0-beta1-e2-security",
+  "to": "2.5.0-beta1-g1-roadrunner",
+  "added_classes": [
+    "InMemoryWorker",
+    "RoadRunnerRuntime",
+    "RoadRunnerWorkerAdapter",
+    "RuntimeInterface",
+    "WorkerInterface"
+  ],
+  "removed_classes": [],
+  "added_public_methods": [
+    "handledRequests",
+    "isRunning",
+    "respond",
+    "runtimeAfterRequest",
+    "stop",
+    "waitRequest"
+  ],
+  "removed_public_methods": [],
+  "justification": "G1 introduces the long-running runtime contract and RoadRunner worker adapter as an intentional public runtime boundary."
+}

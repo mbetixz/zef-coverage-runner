@@ -1,0 +1,5 @@
+<?php
+declare(strict_types=1);
+$root=dirname(__DIR__,2);$source=$root.'/src/Framework/Qualification/Governance.php';$autoload=$root.'/src/autoload.php';
+$sourceText=(string)file_get_contents($source);$autoloadText=(string)file_get_contents($autoload);$testText=(string)file_get_contents($root.'/tests/Unit/G4_8QualificationGovernanceTest.php');
+$checks=['source exists'=>is_file($source),'autoload exists'=>is_file($autoload),'no sleep'=>!str_contains($sourceText,'sleep('),'no scheduler'=>!preg_match('/scheduler|queue|worker/i',$sourceText),'no network'=>!preg_match('/curl_|fsockopen|stream_socket|socket_create/i',$sourceText),'sha256 bounded'=>str_contains($sourceText,'^[a-f0-9]{64}$'),'mandatory evidence'=>str_contains($sourceText,'A mandatory PASS gate requires evidence.'),'waiver not promotion'=>str_contains($sourceText,'status !== QualificationStatus::PASS'),'qualification autoload'=>str_contains($autoloadText,'QualificationStatus'),'bootstrap test'=>str_contains($testText,'src/autoload.php')];foreach($checks as $name=>$ok){echo($ok?'PASS':'FAIL')." {$name}\n";if(!$ok)exit(1);}echo "W6 qualification governance architecture: 10/10 PASS\n";

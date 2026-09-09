@@ -1,0 +1,21 @@
+{
+  "from": "2.5.0-beta1-p",
+  "to": "2.5.0-beta1-h2",
+  "added_classes": [
+    "EventBusInterface",
+    "EventContext",
+    "EventDispatchException",
+    "EventDispatcher",
+    "EventRegistration",
+    "EventSubscriberInterface"
+  ],
+  "removed_classes": [],
+  "added_public_methods": [
+    "dispatchWithContext",
+    "listen",
+    "registrations",
+    "subscribe"
+  ],
+  "removed_public_methods": [],
+  "justification": "H2 introduces the in-process/domain Event Bus and explicit event context/dispatch contracts; no existing public classes or methods are removed."
+}

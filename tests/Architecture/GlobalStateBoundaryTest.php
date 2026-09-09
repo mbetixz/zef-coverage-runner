@@ -1,0 +1,2 @@
+<?php
+declare(strict_types=1); require __DIR__.'/_assert.php'; $root=dirname(__DIR__,2); $s=architecture_source($root); $lines=preg_split('/\R/',$s); if($lines===false){$lines=[];} $in=false; $bad=[]; foreach($lines as $i=>$line){ if(str_contains($line,'final class RequestFactory')) $in=true; if($in && str_contains($line,'namespace ')) $in=false; if(preg_match('/\$_(GET|POST|SERVER|REQUEST|COOKIE|FILES|SESSION)\b/',$line) && !$in && $i<2200) $bad[]=$i+1; } architecture_check($bad===[],'superglobal access is confined to boundary/bootstrap');

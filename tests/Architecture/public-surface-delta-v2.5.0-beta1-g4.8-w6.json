@@ -1,0 +1,20 @@
+{
+  "baseline": "v2.5.0-beta1-g4.8-w5",
+  "workstream": "W6",
+  "added_classes": [
+    "Zef\\Framework\\Qualification\\QualificationStatus",
+    "Zef\\Framework\\Qualification\\QualificationGate",
+    "Zef\\Framework\\Qualification\\QualificationEvidence",
+    "Zef\\Framework\\Qualification\\QualificationGateResult",
+    "Zef\\Framework\\Qualification\\QualificationLedger"
+  ],
+  "added_methods": [
+    "Zef\\Framework\\Qualification\\QualificationLedger::register",
+    "Zef\\Framework\\Qualification\\QualificationLedger::record",
+    "Zef\\Framework\\Qualification\\QualificationLedger::status",
+    "Zef\\Framework\\Qualification\\QualificationLedger::results",
+    "Zef\\Framework\\Qualification\\QualificationLedger::canPromote"
+  ],
+  "removed_classes": [],
+  "removed_methods": []
+}

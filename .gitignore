@@ -1,0 +1,76 @@
+# ============================================================
+# ZEF Framework — .gitignore (disempurnakan, Fase A1 / RM-03b)
+# Kebijakan: repo hanya berisi source + config + docs + tools.
+# Semua artefak generated / runtime / evidence lokal DILARANG masuk.
+# ============================================================
+
+# --- Dependensi & toolchain (di-install ulang via Composer) ---
+/vendor/
+/.zef/
+/composer.phar
+
+# --- Runtime & cache ---
+/var/
+/*.pid
+/*.log
+/*.out
+/.deptrac.cache
+/.php-cs-fixer.cache
+/.phpunit.result.cache
+/phpstan*.cache
+/.phpstan/
+
+# --- Binary lokal (RoadRunner dll.) ---
+/rr
+/rr.exe
+/rr.lite
+
+# --- Artefak build/release ---
+/dist/
+/dist/clean-release/
+/zef_framework_*.php
+/RELEASE_MANIFEST_*.txt
+/SHA256-P.txt
+/SHA256SUMS.txt
+/SHA256SUMS_*.txt
+/SHA256SUMS-*.txt
+/*_CANDIDATE_SHA256SUMS.txt
+/*_ADDITIVE_SHA256SUMS.txt
+/supply-chain/*.intoto.json
+# Seed monolit kanonik DI-TRACK (Opsi 1, ADR bootstrap CI 2026-09): root
+# monolit + dist/ tetap gitignored (repo source-only), tapi salinan kanonik
+# utk CI di supply-chain/canonical/ WAJIB ikut repo (clone segar runner butuh
+# baseline builder). Pola di atas (/) tidak kena subdir ini.
+!/supply-chain/canonical/
+
+# --- Hasil test / cakupan ---
+/tests/_history/
+# Artefak historis Public Surface baseline alpha4 DI-TRACK (preseden auditor
+# W6/Q85: SHA-256 ad6a5ea9.. diverifikasi byte-identical dari arsip; test
+# TestArtifactCompletenessTest mewajibkan file ini ada di clone segar CI).
+!/tests/_history/
+!/tests/_history/public-surface-baseline-alpha4.php
+/.phpunit.result.cache
+/coverage/
+*.cov
+
+# --- Backup & editor ---
+*.bak
+*.orig
+*.swp
+*~
+.DS_Store
+
+# --- Pengecualian: direktori placeholder wajib repo (bila ada) ---
+# !/var/.gitkeep
+# !/supply-chain/.gitkeep
+
+# --- Artefak lokal sesi audit/remediasi (tidak untuk repo) ---
+/_history/
+/*.out
+/phpstan_w2*.txt
+/phpstan_targeted_final.txt
+/scan/
+/supply-chain/scan/
+/Qualification/
+/Regression/SecurityHardeningTest.php

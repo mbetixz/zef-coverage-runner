@@ -1,0 +1,185 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Zef\Framework\Observability {
+
+    use Psr\Log\LoggerInterface;
+    use Psr\Log\NullLogger;
+
+    final class Telemetry
+    {
+        /** @var list<LogRecord> */ private array $logs = [];
+        /** @var list<array<string,array{count:int|float,sum:float,attributes:array<string,mixed>}>> */ private array $metricDeliveryQueue = [];
+        /** @var list<list<LogRecord>> */ private array $logDeliveryQueue = [];
+        private bool $shutdown = false;
+        public function __construct(private readonly TracerInterface $tracer, private readonly MeterInterface $meter, private readonly BatchSpanProcessor $processor, private readonly ?MetricExporterInterface $metricExporter = null, private readonly ?LogExporterInterface $logExporter = null, private readonly bool $enabled = true)
+        {
+        }
+        public static function fromEnvironment(?LoggerInterface $logger = null): self
+        {
+            $enabled = filter_var((string) (getenv('ZEF_OTEL_ENABLED') ?: '0'), FILTER_VALIDATE_BOOL);
+            $logger ??= new NullLogger();
+            if (!$enabled) {
+                return new self(new NoopTracer(), new CounterMeter(), new BatchSpanProcessor(new InMemorySpanExporter()), null, null, false);
+            }
+            $endpoint = trim((string) (getenv('ZEF_OTEL_EXPORTER_OTLP_ENDPOINT') ?: ''));
+            if ($endpoint !== '') {
+                self::validateEndpoint($endpoint);
+            }
+            $timeout = self::envIntRequired('ZEF_OTEL_EXPORT_TIMEOUT_MS', 500, 1, 10000);
+            $queue = self::envIntRequired('ZEF_OTEL_MAX_QUEUE', 1024, 1, 8192);
+            $batch = self::envIntRequired('ZEF_OTEL_BATCH_SIZE', 128, 1, $queue);
+            self::envIntRequired('ZEF_OTEL_RETRY_ATTEMPTS', 2, 0, 10);
+            self::envIntRequired('ZEF_OTEL_RETRY_DELAY_MS', 100, 0, 10000);
+            self::envIntRequired('ZEF_OTEL_RETRY_DELAY_CAP_MS', 1000, 0, 60000);
+            self::envIntRequired('ZEF_OTEL_SHUTDOWN_DRAIN_MS', 2000, 0, 60000);
+            $resource = ['service.name' => (string) (getenv('ZEF_OTEL_SERVICE_NAME') ?: 'zef-application'),'telemetry.sdk.name' => 'zef-observability','telemetry.sdk.language' => 'php'];
+            $exporter = $endpoint !== '' ? new OtlpHttpJsonExporter($endpoint, $resource, $timeout) : null;
+            $spanExporter = $exporter ?? new InMemorySpanExporter();
+            $processor = new BatchSpanProcessor($spanExporter, $queue, $batch);
+            $t = new self(new Tracer($processor), new CounterMeter(), $processor, $exporter, $exporter, true);
+            register_shutdown_function($t->shutdown(...));
+            return $t;
+        }
+        /** @param array<string,mixed> $attributes */
+        public function startSpan(string $name, array $attributes = [], ?SpanContext $parent = null): SpanInterface
+        {
+            return $this->tracer->startSpan($name, $attributes, $parent);
+        }
+        public function tracer(): TracerInterface
+        {
+            return $this->tracer;
+        }
+        public function meter(): MeterInterface
+        {
+            return $this->meter;
+        }
+        public function extract(string $traceParent, string $traceState = ''): ?SpanContext
+        {
+            return TraceContextPropagator::extract($traceParent, $traceState !== '' ? $traceState : null);
+        }
+        /** @param array<string,mixed> $attributes */
+        public function recordLog(string $severity, string $body, array $attributes = []): void
+        {
+            if (!$this->enabled || $this->shutdown || count($this->logs) >= 256) {
+                return;
+            }$this->logs[] = new LogRecord(strtoupper($severity), TelemetrySanitizer::string($body), TelemetryClock::nowUnixNano(), TelemetrySanitizer::attributes($attributes));
+        }
+        public function flush(): void
+        {
+            if (!$this->enabled || $this->shutdown) {
+                return;
+            }$this->meter->increment('zef.lifecycle.events.total', 1, ['event.name' => 'telemetry.flush']);
+            $this->processor->flush();
+            $this->enqueueDelivery();
+            $this->drainDelivery();
+        }
+        private function enqueueDelivery(): void
+        {
+            if ($this->metricExporter !== null && count($this->metricDeliveryQueue) < 1024) {
+                $this->metricDeliveryQueue[] = $this->meter->snapshot();
+            }if ($this->logs !== []) {
+                $logs = $this->logs;
+                $this->logs = [];
+                if (count($this->logDeliveryQueue) < 1024) {
+                    $this->logDeliveryQueue[] = $logs;
+                }
+            }
+        }
+        private function drainDelivery(): void
+        {
+            while ($this->metricDeliveryQueue !== []) {
+                $metrics = array_shift($this->metricDeliveryQueue);
+                if ($this->metricExporter === null) {
+                    continue;
+                }try {
+                    $this->metricExporter->exportMetrics($metrics);
+                } catch (\Throwable) {
+                }
+            }while ($this->logDeliveryQueue !== []) {
+                $logs = array_shift($this->logDeliveryQueue);
+                if ($this->logExporter === null) {
+                    continue;
+                }try {
+                    $this->logExporter->exportLogs($logs);
+                } catch (\Throwable) {
+                }
+            }
+        }
+        public function shutdown(): void
+        {
+            if (!$this->enabled || $this->shutdown) {
+                return;
+            }$this->meter->increment('zef.lifecycle.events.total', 1, ['event.name' => 'telemetry.flush']);
+            try {
+                $this->processor->shutdown();
+            } catch (\Throwable) {
+            }$deadline = microtime(true) + self::envIntRequired('ZEF_OTEL_SHUTDOWN_DRAIN_MS', 2000, 0, 60000) / 1000;
+            while (($this->metricDeliveryQueue !== [] || $this->logDeliveryQueue !== []) && microtime(true) < $deadline) {
+                $this->drainOne();
+            }try {
+                $this->metricExporter?->shutdown();
+            } catch (\Throwable) {
+            }try {
+                if ($this->logExporter !== null && $this->logExporter !== $this->metricExporter) {
+                    $this->logExporter->shutdown();
+                }
+            } catch (\Throwable) {
+            }$this->shutdown = true;
+            $this->meter->increment('zef.lifecycle.events.total', 1, ['event.name' => 'telemetry.shutdown']);
+            $this->logs = [];
+            $this->metricDeliveryQueue = [];
+            $this->logDeliveryQueue = [];
+        }
+        private function drainOne(): void
+        {
+            if ($this->metricDeliveryQueue !== [] && $this->metricExporter !== null) {
+                $metrics = array_shift($this->metricDeliveryQueue);
+                try {
+                    $this->metricExporter->exportMetrics($metrics);
+                } catch (\Throwable) {
+                    return;
+                }
+            }if ($this->logDeliveryQueue !== [] && $this->logExporter !== null) {
+                $logs = array_shift($this->logDeliveryQueue);
+                try {
+                    $this->logExporter->exportLogs($logs);
+                } catch (\Throwable) {
+                }
+            }
+        }
+        public function isEnabled(): bool
+        {
+            return $this->enabled;
+        } public function isInMemoryExporter(): bool
+        {
+            return $this->processor->isInMemoryExporter();
+        }
+        private static function validateEndpoint(string $endpoint): void
+        {
+            $parts = parse_url($endpoint);
+            if (!is_array($parts) || !isset($parts['scheme'],$parts['host']) || !in_array(strtolower((string) $parts['scheme']), ['http','https'], true)) {
+                throw new \InvalidArgumentException('ZEF_OTEL_EXPORTER_OTLP_ENDPOINT must be an absolute HTTP/HTTPS URI.');
+            }if (isset($parts['user']) || isset($parts['pass'])) {
+                throw new \InvalidArgumentException('ZEF_OTEL_EXPORTER_OTLP_ENDPOINT must not contain embedded credentials.');
+            }
+        }
+        private static function envIntRequired(string $name, int $default, int $min, int $max): int
+        {
+            $raw = getenv($name);
+            if ($raw === false || trim($raw) === '') {
+                return $default;
+            }if (filter_var($raw, FILTER_VALIDATE_INT) === false) {
+                throw new \InvalidArgumentException($name . ' must be an integer.');
+            }$v = (int) $raw;
+            if ($v < $min || $v > $max) {
+                throw new \InvalidArgumentException($name . ' is outside its allowed range.');
+            }return $v;
+        }
+    }
+}
+
+namespace {
+    require_once __DIR__ . '/TelemetryLogger.php';
+}

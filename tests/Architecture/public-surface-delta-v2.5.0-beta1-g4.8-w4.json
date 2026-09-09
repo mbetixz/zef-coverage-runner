@@ -1,0 +1,22 @@
+{
+  "baseline": "v2.5.0-beta1-g4.8-w3",
+  "candidate": "v2.5.0-beta1-g4.8-w4",
+  "classes": [
+    "Zef\\Framework\\Observability\\CorrelationContext",
+    "Zef\\Framework\\Observability\\CorrelationHeaders",
+    "Zef\\Framework\\Observability\\CorrelationPropagator",
+    "Zef\\Framework\\Observability\\CorrelationContextCarrierInterface",
+    "Zef\\Framework\\Observability\\ExplicitCorrelationContextCarrier"
+  ],
+  "methods": [
+    "CorrelationContext::traceParent",
+    "CorrelationContext::propagationBytes",
+    "CorrelationContext::redactedAttributes",
+    "CorrelationHeaders::encodedBytes",
+    "CorrelationPropagator::extract",
+    "CorrelationPropagator::inject",
+    "CorrelationPropagator::disabled",
+    "CorrelationContextCarrierInterface::correlationContext"
+  ],
+  "removed": []
+}

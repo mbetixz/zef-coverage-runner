@@ -1,0 +1,39 @@
+{
+  "from": "2.5.0-beta1-h3",
+  "to": "2.5.0-beta1-m",
+  "added_classes": [
+    "InMemoryJobIdempotencyStore",
+    "InMemoryJobQueue",
+    "InProcessJobWorker",
+    "JobCancelledException",
+    "JobContext",
+    "JobEnvelope",
+    "JobExecutionException",
+    "JobHandlerInterface",
+    "JobIdempotencyStoreInterface",
+    "JobInterface",
+    "JobMiddlewareInterface",
+    "JobQueueInterface",
+    "JobResult",
+    "JobTimeoutException",
+    "RetryPolicy"
+  ],
+  "removed_classes": [],
+  "added_public_methods": [
+    "cancel",
+    "compare",
+    "deadlineUnixNano",
+    "delayMs",
+    "dequeue",
+    "enqueue",
+    "isCancelled",
+    "isTimedOut",
+    "nextAttempt",
+    "processOne",
+    "shouldRetry",
+    "size",
+    "throwIfCancelled",
+    "withDeadlineMs"
+  ],
+  "removed_public_methods": []
+}

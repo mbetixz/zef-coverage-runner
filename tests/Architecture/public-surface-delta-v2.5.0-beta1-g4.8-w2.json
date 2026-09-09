@@ -1,0 +1,26 @@
+{
+  "version": "2.5.0-beta1-g4.8-w2",
+  "base": "2.5.0-beta1-g4.7",
+  "workstream": "W2",
+  "classes": [
+    "CancellationTokenInterface",
+    "NeverCancelledToken",
+    "RemoteRequest",
+    "RemoteTransportInterface",
+    "RemoteTransportResult",
+    "TransportContext",
+    "TransportOutcome"
+  ],
+  "methods": [
+    "isCancellationRequested",
+    "operation",
+    "payload",
+    "metadata",
+    "send",
+    "isCancelled",
+    "hasExpired",
+    "remainingMs",
+    "isDefinitive"
+  ],
+  "notes": "Additive W2 transport boundary only; no existing public declaration is removed."
+}

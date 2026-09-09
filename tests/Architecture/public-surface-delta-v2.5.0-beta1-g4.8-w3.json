@@ -1,0 +1,41 @@
+{
+  "version": "2.5.0-beta1-g4.8-w3",
+  "base": "2.5.0-beta1-g4.8-w2",
+  "workstream": "W3",
+  "classes": [
+    "BoundedInMemoryIdempotencyStore",
+    "DeliveryAttempt",
+    "DeliveryMode",
+    "DeliveryObservation",
+    "DeliveryOperation",
+    "DeliveryReconciliationInterface",
+    "DeliveryResult",
+    "DeliverySafety",
+    "DeliverySemanticsEvaluator",
+    "DeliveryState",
+    "DeliveryStateMachine",
+    "ExecutionCertainty",
+    "IdempotencyClaim",
+    "IdempotencyGuaranteeInterface",
+    "IdempotencyRecord",
+    "IdempotencyStoreInterface",
+    "RetryContext",
+    "RetryDecision",
+    "RetryDecisionReason",
+    "RetryPolicy"
+  ],
+  "methods": [
+    "delayMs",
+    "supports",
+    "claim",
+    "complete",
+    "completedResult",
+    "reconcile",
+    "state",
+    "transition",
+    "executionCertainty",
+    "shouldRetry",
+    "shouldRetryObservation"
+  ],
+  "notes": "Additive W3 delivery-semantics boundary only; no existing public declaration is removed. Constructor signatures are intentionally excluded from this delta list."
+}

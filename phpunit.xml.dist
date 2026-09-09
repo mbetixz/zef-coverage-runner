@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         failOnWarning="true"
+         failOnRisky="true"
+         cacheDirectory="var/phpunit">
+  <testsuites>
+    <testsuite name="unit"><directory>tests/Unit</directory></testsuite>
+    <testsuite name="qualification"><directory>tests/Qualification</directory></testsuite>
+    <testsuite name="integration"><directory>tests/Integration</directory></testsuite>
+  </testsuites>
+  <source>
+    <include><directory>src</directory></include>
+  </source>
+  <!-- Batch 13 (MR !55): branch coverage DIUJI dan DITANGGUHKAN LAGI.
+       pathCoverage=true diaktifkan fase baseline (threshold 0) memakai image
+       ci/php84:debug (Batch 12/MR !54: Xdebug baked-in, TANPA kompilasi PECL
+       per-job), tetapi phpunit tetap di-KILL sistem (OOM, exit 137) 1,8
+       detik setelah start di runner zef-aws-docker (job 16389941675, pipeline
+       2832641845; lihat trace: "Killed", exit code 137). Ini membuktikan OOM
+       branch = LIMIT MEMORI CONTAINER RUNNER saat Xdebug XDEBUG_CC_BRANCH_CHECK
+       mengumpulkan data branch (line-only: heap ~50MB sukses), BUKAN kompilasi
+       Xdebug (Analisa.md S2/S4 Batch 12 tidak menyelesaikan). Runner alternatif
+       (zef-daytona-docker, memory besar) OFFLINE. Keputusan Batch 13: line gate
+       >=80% WAJIB tetap aktif; pathCoverage dicabut (line-only hijau); branch
+       coverage ditangguhkan ke batch berikutnya setelah runner memadai tersedia.
+       php-code-coverage 14.3.2 + image :debug dipertahankan (siap dipakai). -->
+  <coverage pathCoverage="true">
+    <!-- Batch 14 (MR !56): baseline branch TERUKUR 88,34% (4327/4898) pasca-swap
+         8G di runner AWS i-0f40a2a8640a0822d (pipeline 2832768621). Threshold
+         branch 70% aktif via CI var COVERAGE_BRANCH_THRESHOLD. -->
+  </coverage>
+</phpunit>

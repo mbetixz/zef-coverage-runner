@@ -1,0 +1,36 @@
+# ============================================================
+# ZEF Framework — .dockerignore untuk build image CI (Dockerfile.ci)
+# Konteks build hanya butuh Dockerfile.ci; sisanya dikecualikan agar
+# konteks kecil (cepat) & tidak bocor artefak lokal ke layer build.
+# ============================================================
+
+# --- Git & CI ---
+.git
+.gitlab-ci.yml
+.github
+
+# --- Dependensi & toolchain (di-install di dalam image) ---
+vendor
+.composer-cache
+composer.phar
+
+# --- Artefak lokal / laporan / dokumentasi (tidak untuk image) ---
+documents
+reports
+scrape
+tools
+*.md
+
+# --- Runtime & cache ---
+var
+.phpunit.result.cache
+.php-cs-fixer.cache
+.phpstan
+phpstan*.cache
+
+# --- Backup & editor ---
+*.bak
+*.orig
+*.swp
+*~
+.DS_Store

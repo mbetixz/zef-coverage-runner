@@ -1,0 +1,29 @@
+{
+  "from": "2.5.0-beta1-h2",
+  "to": "2.5.0-beta1-h1",
+  "added_classes": [
+    "CommandBus",
+    "CommandBusInterface",
+    "CommandHandlerInterface",
+    "CqrsContext",
+    "CqrsEventResult",
+    "CqrsHandlerConflictException",
+    "CqrsHandlerNotFoundException",
+    "CqrsMiddlewareInterface",
+    "IdempotencyStoreInterface",
+    "InMemoryIdempotencyStore",
+    "QueryBus",
+    "QueryBusInterface",
+    "QueryHandlerInterface"
+  ],
+  "removed_classes": [],
+  "added_public_methods": [
+    "__invoke",
+    "ask",
+    "remember",
+    "toEventContext",
+    "use"
+  ],
+  "removed_public_methods": [],
+  "justification": "H1 adds CQRS command/query buses, handler contracts, CQRS context/event result, and idempotency contract; no prior public API is removed."
+}

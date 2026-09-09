@@ -1,0 +1,17 @@
+{
+  "from": "2.5.0-beta1-container-compiler",
+  "to": "2.5.0-beta1-e2-security",
+  "added_classes": [
+    "ClientAddressResolver",
+    "CsrfTokenManager",
+    "InMemoryRateLimiter",
+    "OriginPolicy",
+    "RateLimitDecision",
+    "RateLimiterInterface",
+    "SecurityContext",
+    "SecurityPolicy",
+    "SecurityRuntimeMiddleware"
+  ],
+  "removed_classes": [],
+  "justification": "E2 intentionally introduces a first-class security runtime subsystem while preserving existing application behavior and keeping enforcement opt-in via explicit policy/environment configuration."
+}

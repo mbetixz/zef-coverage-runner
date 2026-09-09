@@ -1,0 +1,19 @@
+{
+  "added_classes": [
+    "MessageBusInterface",
+    "MessageContext",
+    "MessageEnvelope",
+    "MessageHandlerInterface",
+    "MessageMiddlewareInterface",
+    "MessageResult",
+    "MessageSerializerInterface",
+    "MessageTransportInterface"
+  ],
+  "removed_classes": [],
+  "added_public_methods": [
+    "deserialize",
+    "send",
+    "serialize"
+  ],
+  "removed_public_methods": []
+}

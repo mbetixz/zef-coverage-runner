@@ -1,0 +1,35 @@
+{
+    "from": "2.5.0-beta1-q",
+    "to": "2.5.0-beta1-p",
+    "added_classes": [
+        "AbstractModule",
+        "ConfigProviderModule",
+        "ModuleConfigProvider",
+        "ModuleContext",
+        "ModuleInterface",
+        "ModuleRegistrar",
+        "ModuleRegistry"
+    ],
+    "removed_classes": [],
+    "added_public_methods": [
+        "addModule",
+        "bootAll",
+        "container",
+        "definition",
+        "getDefinition",
+        "getName",
+        "isBooted",
+        "isRegistered",
+        "isStarted",
+        "modules",
+        "name",
+        "provider",
+        "registerAll",
+        "resolveOrder",
+        "shutdownAll",
+        "start",
+        "startAll"
+    ],
+    "removed_public_methods": [],
+    "justification": "P intentionally introduces first-class module lifecycle and registry APIs; this delta is the governed public-surface expansion."
+}

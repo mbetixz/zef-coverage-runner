@@ -1,0 +1,31 @@
+{
+  "base": "v2.5.0-beta1-g4.8-w4-remediated",
+  "candidate": "v2.5.0-beta1-g4.8-w5",
+  "classes": [
+    "Zef\\Framework\\Security\\Distributed\\AuthenticationStatus",
+    "Zef\\Framework\\Security\\Distributed\\ReplayDecision",
+    "Zef\\Framework\\Security\\Distributed\\SecurityVerdict",
+    "Zef\\Framework\\Security\\Distributed\\SecurityFailure",
+    "Zef\\Framework\\Security\\Distributed\\CredentialHandle",
+    "Zef\\Framework\\Security\\Distributed\\SecurityContext",
+    "Zef\\Framework\\Security\\Distributed\\SecurityRequest",
+    "Zef\\Framework\\Security\\Distributed\\AuthenticationResult",
+    "Zef\\Framework\\Security\\Distributed\\AuthorizationResult",
+    "Zef\\Framework\\Security\\Distributed\\ReplayResult",
+    "Zef\\Framework\\Security\\Distributed\\SecurityAdmissionDecision",
+    "Zef\\Framework\\Security\\Distributed\\BoundedInMemoryReplayProtector",
+    "Zef\\Framework\\Security\\Distributed\\DefaultSecurityBoundary"
+  ],
+  "methods": [
+    "Zef\\Framework\\Security\\Distributed\\ReplayResult::allows",
+    "Zef\\Framework\\Security\\Distributed\\SecurityAdmissionDecision::allows",
+    "Zef\\Framework\\Security\\Distributed\\CredentialProviderInterface::resolve",
+    "Zef\\Framework\\Security\\Distributed\\AuthorizationPolicyInterface::authorize",
+    "Zef\\Framework\\Security\\Distributed\\ReplayProtectorInterface::check",
+    "Zef\\Framework\\Security\\Distributed\\SecurityBoundaryInterface::admit",
+    "Zef\\Framework\\Security\\Distributed\\BoundedInMemoryReplayProtector::__construct",
+    "Zef\\Framework\\Security\\Distributed\\BoundedInMemoryReplayProtector::check",
+    "Zef\\Framework\\Security\\Distributed\\DefaultSecurityBoundary::admit"
+  ],
+  "removed": []
+}

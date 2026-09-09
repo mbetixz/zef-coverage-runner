@@ -1,0 +1,9 @@
+{
+  "from": "2.5.0-beta1-j2",
+  "to": "2.5.0-beta1-q",
+  "added_classes": [],
+  "removed_classes": [],
+  "added_public_methods": [],
+  "removed_public_methods": [],
+  "justification": "Q adds executable architecture governance and intentionally introduces no framework public API."
+}
