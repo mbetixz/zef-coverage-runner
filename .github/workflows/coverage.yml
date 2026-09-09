@@ -1,0 +1,122 @@
+# ZEF Framework — Coverage Runner (GitHub Actions)
+#
+# Fase 1 POC blueprint "GitLab -> GitHub Runner Cluster": menjalankan PHPUnit
+# + Xdebug BRANCH coverage di GitHub-hosted runner (2 vCPU / 7 GB RAM, gratis
+# utk repo public) sebagai KOMPLEMEN runner GitLab yang OOM (exit 137) saat
+# job coverage branch.
+#
+# PARITAS 1:1 dengan job `coverage` di .gitlab-ci.yml zeflous/zef:
+#   - PHP 8.4 + Xdebug (mode=coverage) + composer install dari composer.lock
+#   - phpunit --configuration phpunit.xml.dist --coverage-clover / --coverage-text
+#     (phpunit.xml.dist memuat <coverage pathCoverage="true"> -> branch coverage)
+#   - verifikasi clover: test -s var/coverage/coverage.xml
+#   - gate fail-closed: tools/coverage-gate.php --line-threshold=80 --branch-threshold=70
+#     (stdout "Coverage: X.XX% lines (...)" identik -> regex badge GitLab juga match)
+#   - artifact: var/coverage/ (clover XML + coverage.txt)
+#
+# Tidak ada secret GitLab di repo ini; hanya source/test/phpunit config (mirror
+# publik tanpa artefak kanonik). Source repo canonical tetaplah zeflous/zef.
+
+name: zef-coverage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  COMPOSER_CACHE_DIR: ${{ github.workspace }}/.composer-cache
+  # Runner standard GitHub = 2 vCPU / 7 GB RAM. Heap PHP 6144M menyisakan
+  # ruang utk OS + Xdebug branch collection (anti OOM; GitLab OOM pada cgroup
+  # ~3.5G, runner ini ~7G). Line-only di GitLab memakai 1024M; branch butuh lebih.
+  PHP_MEMORY_LIMIT: "6144M"
+
+jobs:
+  coverage:
+    name: PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+
+      - name: Cache Composer
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/
+            .composer-cache/
+          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-${{ runner.os }}-
+
+      - name: Setup PHP 8.4 + Xdebug (coverage)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: xdebug
+          tools: composer:v2
+          ini-values: memory_limit=${{ env.PHP_MEMORY_LIMIT }}
+        env:
+          fail-fast: true
+
+      - name: Verify PHP + Xdebug (fail-closed)
+        run: |
+          php --version
+          php -r 'if (!extension_loaded("xdebug")) { fwrite(STDERR, "MISSING XDEBUG - setup-php gagal" . PHP_EOL); exit(1); } echo "Xdebug OK: " . phpversion("xdebug") . PHP_EOL;'
+
+      - name: Composer install (lock 1:1)
+        run: composer install --prefer-dist --no-progress --no-interaction --no-scripts --optimize-autoloader
+
+      - name: PHPUnit + Xdebug branch coverage
+        run: |
+          mkdir -p var/phpunit var/coverage
+          XDEBUG_MODE=coverage \
+          php -d memory_limit="${PHP_MEMORY_LIMIT}" \
+            vendor/bin/phpunit \
+            --configuration phpunit.xml.dist \
+            --colors=never \
+            --coverage-clover=var/coverage/coverage.xml \
+            --coverage-text=var/coverage/coverage.txt
+
+      - name: Verify clover report (fail-closed)
+        run: test -s var/coverage/coverage.xml
+
+      - name: Coverage gate (fail-closed: line>=80, branch>=70)
+        run: |
+          php tools/coverage-gate.php \
+            --clover=var/coverage/coverage.xml \
+            --line-threshold=80 \
+            --branch-threshold=70 | tee var/coverage/gate.txt
+
+      - name: Summary (coverage values)
+        if: always()
+        run: |
+          {
+            echo "### Coverage (mirror zeflous/zef @ main)"
+            echo '```'
+            cat var/coverage/coverage.txt 2>/dev/null || echo "(coverage.txt tidak ada)"
+            echo '```'
+            echo "Gate:"
+            echo '```'
+            cat var/coverage/gate.txt 2>/dev/null || echo "(gate tidak jalan)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifacts (clover + text + gate)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zef-coverage-report
+          path: |
+            var/coverage/
+            var/phpunit/
+          if-no-files-found: warn
+          retention-days: 14
