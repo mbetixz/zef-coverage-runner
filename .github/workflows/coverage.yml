@@ -108,11 +108,73 @@ jobs:
         run: test -s var/coverage/coverage.xml
 
       - name: "Coverage gate (fail-closed: line>=80, branch>=70)"
+        id: coverage-gate
         run: |
+          set -euo pipefail
           php tools/coverage-gate.php \
             --clover=var/coverage/coverage.xml \
             --line-threshold=80 \
             --branch-threshold=70 | tee var/coverage/gate.txt
+
+      # ============================================================
+      # Fase 3: kirim balik Commit Status API ke GitLab zeflous/zef
+      # (project 86155206) utk SHA zef yang di-mirror oleh job
+      # coverage-offload (.gitlab-ci.yml). Status external check
+      # github-actions/coverage tampil di commit/MR GitLab sbg bukti
+      # coverage GitHub (state success/failed sesuai hasil gate).
+      # Best-effort: bila subject commit TIDAK memuat "mirror(zef
+      # <sha>)" (mis. workflow_dispatch manual / push langsung ke repo
+      # GitHub), step di-skip exit 0 - tidak ada commit zef yang
+      # berkorespondensi. Secret GITLAB_TOKEN tidak pernah di-echo
+      # (GitHub Actions otomatis me-mask secret di log).
+      # ============================================================
+      - name: Report status to GitLab (Commit Status API - Fase 3)
+        id: coverage-report-gitlab
+        if: always()
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GITLAB_TOKEN:-}" ]; then
+            echo "skip: secret GITLAB_TOKEN tidak tersedia di repo ini"
+            exit 0
+          fi
+          SUBJECT="$(git log -1 --pretty=%s)"
+          ZEF_SHA_SHORT="$(printf '%s' "${SUBJECT}" | sed -nE 's/^mirror\(zef ([0-9a-f]{7,40})\):.*/\1/p')"
+          if [ -z "${ZEF_SHA_SHORT}" ]; then
+            echo "skip: subject commit bukan mirror offload (${SUBJECT}) - tidak ada SHA zef utk di-status"
+            exit 0
+          fi
+          # Resolve short -> full SHA di GitLab (repo source canonical).
+          FULL_SHA="$(curl -fsS --max-time 20 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            "https://gitlab.com/api/v4/projects/86155206/repository/commits/${ZEF_SHA_SHORT}" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)"
+          if [ -z "${FULL_SHA}" ]; then
+            echo "warning: tidak bisa resolve SHA zef ${ZEF_SHA_SHORT} di GitLab - status tidak dikirim"
+            exit 0
+          fi
+          # State ditentukan oleh outcome step gate (if: always() ->
+          # sukses DAN gagal sama-sama dilaporkan).
+          if [ "${{ steps.coverage-gate.outcome }}" = "success" ]; then
+            STATE="success"
+            DESC="Coverage GitHub PASS: $(head -1 var/coverage/gate.txt 2>/dev/null || echo 'gate tidak terbaca')"
+          else
+            STATE="failed"
+            DESC="Coverage GitHub FAILED - lihat run GitHub Actions"
+          fi
+          DESC="${DESC:0:200}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "== Kirim Commit Status ${STATE} utk zef ${FULL_SHA} (context: github-actions/coverage) =="
+          PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"state":sys.argv[1],"context":"github-actions/coverage","description":sys.argv[2],"target_url":sys.argv[3]}))' "${STATE}" "${DESC}" "${RUN_URL}")"
+          HTTP_CODE="$(curl -sS --max-time 30 -o /tmp/gl-status-resp.json -w '%{http_code}' \
+            -X POST -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H "Content-Type: application/json" \
+            "https://gitlab.com/api/v4/projects/86155206/statuses/${FULL_SHA}" -d "${PAYLOAD}")"
+          echo "GitLab statuses API -> HTTP ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" != "201" ]; then
+            echo "--- resp ---"
+            head -c 500 /tmp/gl-status-resp.json 2>/dev/null || true
+            echo ""
+          fi
 
       - name: Summary (coverage values)
         if: always()
