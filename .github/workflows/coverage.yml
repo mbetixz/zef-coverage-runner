@@ -89,7 +89,7 @@ jobs:
       - name: Verify clover report (fail-closed)
         run: test -s var/coverage/coverage.xml
 
-      - name: Coverage gate (fail-closed: line>=80, branch>=70)
+      - name: "Coverage gate (fail-closed: line>=80, branch>=70)"
         run: |
           php tools/coverage-gate.php \
             --clover=var/coverage/coverage.xml \
