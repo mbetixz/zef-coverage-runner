@@ -72,6 +72,24 @@ jobs:
           php --version
           php -r 'if (!extension_loaded("xdebug")) { fwrite(STDERR, "MISSING XDEBUG - setup-php gagal" . PHP_EOL); exit(1); } echo "Xdebug OK: " . phpversion("xdebug") . PHP_EOL;'
 
+      # PARITAS dengan image CI GitLab (Dockerfile.ci): image tsb TIDAK memuat
+      # APCu, sehingga test ApcuRateLimiter* di-SKIP (sama seperti GitLab).
+      # Runner GitHub kebetulan punya APCu aktif -> test yang sama JALAN dan
+      # gagal (expectation window-reset tidak cocok dgn fixed-window impl).
+      # Nonaktifkan APCu agar perilaku suite identik dgn GitLab CI.
+      - name: Disable APCu (paritas image GitLab CI - apcu tests skipped)
+        run: |
+          set -e
+          INI_DIR=$(php --ini | awk -F': ' '/Scan for additional .ini files/ {print $2}' | tr -d ' ')
+          if [ -n "$INI_DIR" ] && [ -d "$INI_DIR" ]; then
+            ls "$INI_DIR" | grep -qi apcu && sudo rm -f "$INI_DIR"/*apcu* || true
+          fi
+          MAIN_INI=$(php --ini | awk -F': ' '/Loaded Configuration File/ {print $2}' | tr -d ' ')
+          if [ -n "$MAIN_INI" ] && [ -f "$MAIN_INI" ]; then
+            sudo sed -i '/^extension[[:space:]]*=[[:space:]]*apcu/d;/^extension[[:space:]]*=[[:space:]]*"apcu/d' "$MAIN_INI" || true
+          fi
+          php -r 'echo "apcu_fetch available after disable: "; var_export(function_exists("apcu_fetch")); echo PHP_EOL;'
+
       - name: Composer install (lock 1:1)
         run: composer install --prefer-dist --no-progress --no-interaction --no-scripts --optimize-autoloader
 
