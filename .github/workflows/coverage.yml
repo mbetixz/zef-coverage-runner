@@ -82,18 +82,22 @@ jobs:
       # Xdebug di-pin eksplisit via `extensions:` (sintaks semver -> PECL):
       #   xdebug-3.5.3  = pasang 3.5.3 + enable sebagai zend_extension
       #   redis         = AKTIFKAN (paritas: image GitLab kini memuat ext-redis)
-      #   :apcu         = NONAKTIFKAN (paritas image GitLab yang tidak memuatnya)
       # KEPUTUSAN PARITAS REDIS (Tahap 2): ext-redis = phpredis CLIENT tanpa
       # server; 7 test Redis (RateLimiterDetailedTest) memakai createMock(Redis)
-      # -> cukup `class_exists('Redis')`. Dahulu ext-redis di-nonaktifkan agar
-      # 7 test itu SKIP di GitHub (menyamai GitLab); kini arahnya dibalik:
-      # ekstensi dipasang di KEDUA sisi sehingga 7 test JALAN di keduanya
-      # (|Δskip| = 0, coverage GitLab kembali ~86.99%).
+      # -> cukup `class_exists('Redis')`.
+      #
+      # JANGAN pakai `:apcu` di sini! Terbukti (run 34506512279): setup-php
+      # memproses `:apcu` SETELAH `redis` dan karena peta dependensinya
+      # menautkan redis->apcu, penonaktifan APCu IKUT menonaktifkan redis:
+      #     ✓ redis Enabled
+      #     ✓ :apcu Disabled redis as it depends on apcu
+      # -> ext-redis akhirnya TIDAK aktif. APCu tetap dinonaktifkan, tetapi di
+      #    step terpisah "Enforce extension parity" (hapus INI + assert).
       - name: Setup PHP 8.4 + Xdebug ${{ env.XDEBUG_PIN }} (pinned, paritas image GitLab CI :debug)
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          extensions: xdebug-${{ env.XDEBUG_PIN }}, redis, :apcu
+          extensions: xdebug-${{ env.XDEBUG_PIN }}, redis
           tools: composer:v2
           ini-values: memory_limit=${{ env.PHP_MEMORY_LIMIT }}
         env:
