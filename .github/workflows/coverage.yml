@@ -81,12 +81,19 @@ jobs:
       #
       # Xdebug di-pin eksplisit via `extensions:` (sintaks semver -> PECL):
       #   xdebug-3.5.3  = pasang 3.5.3 + enable sebagai zend_extension
-      #   :apcu, :redis = NONAKTIFKAN (paritas image GitLab yang tidak memuatnya)
+      #   redis         = AKTIFKAN (paritas: image GitLab kini memuat ext-redis)
+      #   :apcu         = NONAKTIFKAN (paritas image GitLab yang tidak memuatnya)
+      # KEPUTUSAN PARITAS REDIS (Tahap 2): ext-redis = phpredis CLIENT tanpa
+      # server; 7 test Redis (RateLimiterDetailedTest) memakai createMock(Redis)
+      # -> cukup `class_exists('Redis')`. Dahulu ext-redis di-nonaktifkan agar
+      # 7 test itu SKIP di GitHub (menyamai GitLab); kini arahnya dibalik:
+      # ekstensi dipasang di KEDUA sisi sehingga 7 test JALAN di keduanya
+      # (|Δskip| = 0, coverage GitLab kembali ~86.99%).
       - name: Setup PHP 8.4 + Xdebug ${{ env.XDEBUG_PIN }} (pinned, paritas image GitLab CI :debug)
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          extensions: xdebug-${{ env.XDEBUG_PIN }}, :apcu, :redis
+          extensions: xdebug-${{ env.XDEBUG_PIN }}, redis, :apcu
           tools: composer:v2
           ini-values: memory_limit=${{ env.PHP_MEMORY_LIMIT }}
         env:
@@ -108,31 +115,32 @@ jobs:
             if ($have !== $pin) { fwrite(STDERR, "XDEBUG DRIFT: terpasang " . $have . " != pin " . $pin . " (paritas GitLab <-> GitHub rusak)" . PHP_EOL); exit(1); }
           '
 
-      # PARITAS dengan image CI GitLab (Dockerfile.ci stage `base`): image tsb
-      # TIDAK memuat APCu MAUPUN ext-redis. Akibatnya di GitLab 16 test di-SKIP
-      # (junit job 16426467514: Batch9ApcuRateLimiterTest 4 + RateLimiterDetailedTest
-      # 7 APCu/Redis + G4_2_OTLPBoundaryIntegrationTest 2). Di runner GitHub
-      # default, ext-redis SUDAH ter-bundel (APCu sudah ditangani) -> 7 test Redis
-      # JALAN di GitHub tapi SKIP di GitLab = |Δskip| 7 (bukan jumlah test, yang
-      # sudah 934 = 934). Nonaktifkan KEDUANYA agar perilaku suite identik.
-      # Assert fail-closed: kalau salah satu extension tetap aktif, run MERAH.
-      - name: Disable APCu + Redis (paritas image GitLab CI - test terkait SKIP)
+      # PARITAS EKSTENSI dengan image CI GitLab (Dockerfile.ci stage `base`):
+      #   - ext-redis : ADA di kedua sisi (GitLab kini memasangnya) -> 7 test
+      #                 Redis (RateLimiterDetailedTest) JALAN di keduanya.
+      #   - APCu      : TIDAK ADA di kedua sisi -> test APCu SKIP di keduanya.
+      # Skip-set identik = |Δskip| 0. Assert fail-closed di bawah: redis WAJIB
+      # aktif (kalau setup-php gagal memasangnya, jangan diam-diam SKIP 7 test),
+      # dan APCu WAJIB tidak aktif (kalau bocor aktif, skip-set bergeser).
+      - name: Enforce extension parity (redis present, APCu absent)
         run: |
           set -e
+          # Bersihkan hanya APCu (redis DIBIARKAN aktif).
           INI_DIR=$(php --ini | awk -F': ' '/Scan for additional .ini files/ {print $2}' | tr -d ' ')
           if [ -n "$INI_DIR" ] && [ -d "$INI_DIR" ]; then
-            ls "$INI_DIR" | grep -qiE 'apcu|redis' && sudo rm -f "$INI_DIR"/*apcu* "$INI_DIR"/*redis* || true
+            ls "$INI_DIR" | grep -qiE 'apcu' && sudo rm -f "$INI_DIR"/*apcu* || true
           fi
           MAIN_INI=$(php --ini | awk -F': ' '/Loaded Configuration File/ {print $2}' | tr -d ' ')
           if [ -n "$MAIN_INI" ] && [ -f "$MAIN_INI" ]; then
-            sudo sed -i '/^extension[[:space:]]*=[[:space:]]*"\?apcu/d;/^extension[[:space:]]*=[[:space:]]*"\?redis/d' "$MAIN_INI" || true
+            sudo sed -i '/^extension[[:space:]]*=[[:space:]]*"\?apcu/d' "$MAIN_INI" || true
           fi
           php -r '
             $apcu = function_exists("apcu_fetch");
             $redis = extension_loaded("redis");
-            echo "apcu_fetch available after disable: "; var_export($apcu); echo PHP_EOL;
-            echo "ext-redis loaded after disable: "; var_export($redis); echo PHP_EOL;
-            if ($apcu || $redis) { fwrite(STDERR, "PARITAS RUSAK: extension yang absen di image GitLab masih aktif (apcu=" . var_export($apcu, true) . ", redis=" . var_export($redis, true) . ")" . PHP_EOL); exit(1); }
+            echo "apcu_fetch available (harus false): "; var_export($apcu); echo PHP_EOL;
+            echo "ext-redis loaded (harus true): "; var_export($redis); echo PHP_EOL;
+            if (!$redis) { fwrite(STDERR, "PARITAS RUSAK: ext-redis TIDAK aktif di GitHub -> 7 test Redis akan SKIP (image GitLab memuatnya)." . PHP_EOL); exit(1); }
+            if ($apcu) { fwrite(STDERR, "PARITAS RUSAK: APCu aktif di GitHub padahal image GitLab tidak memuatnya." . PHP_EOL); exit(1); }
           '
 
       - name: Composer install (lock 1:1)
