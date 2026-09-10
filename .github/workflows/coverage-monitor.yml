@@ -1,0 +1,282 @@
+# ZEF Framework — Coverage Gate Monitor (Fase 6 / rekomendasi lanjutan #2)
+#
+# Sejak Fase 4-5, GitHub Actions adalah SATU-SATUNYA executor coverage zef dan
+# `coverage-wait` (GitLab) adalah gate blocker keras di `main`. Konsekuensinya:
+# kegagalan beruntun di GitHub = semua merge ke main TERBLOKIR. Workflow ini
+# adalah jaring pengaman yang berjalan terjadwal (harian) dan:
+#
+#   1. Memeriksa run coverage terakhir; bila N run terakhir (default 2) BUKAN
+#      success -> ALERT (issue GitHub di repo ini + issue GitLab di zeflous/zef).
+#   2. Audit kebocoran isi mirror public (rec #4): memastikan tidak ada file
+#      kanonik / secret yang ikut ter-mirror (fail-closed).
+#   3. Dedupe: alert hanya dibuka sekali; selama insiden berlanjut, alert
+#      di-COMMENT (bukan issue baru), dan otomatis DITUTUP saat hijau lagi.
+#
+# Kanal alert (bisa dipantau, nyata):
+#   - GitHub Issue berlabel `coverage-alert` di mbetixz/zef-coverage-runner
+#   - GitLab Issue berlabel `coverage-alert` di zeflous/zef (project 86155206)
+#   - Kegagalan workflow ini sendiri (notifikasi email GitHub bawaan)
+#
+# Uji alert: Actions -> coverage-monitor -> Run workflow ->
+#   simulate_failure = true  (memaksa ALERT tanpa menunggu insiden nyata).
+
+name: coverage-monitor
+
+on:
+  schedule:
+    # Harian 03:17 UTC (10:17 WIB). Jam ganjil menghindari padatnya :00.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Simulasi kegagalan beruntun (uji alert end-to-end)"
+        type: boolean
+        default: false
+      failure_threshold:
+        description: "Jumlah run gagal beruntun pemicu alert"
+        type: number
+        default: 2
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: coverage-monitor
+  cancel-in-progress: false
+
+env:
+  GITLAB_PROJECT_ID: "86155206"
+  GITLAB_API: "https://gitlab.com/api/v4"
+
+jobs:
+  monitor:
+    name: Monitor gate coverage + audit mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ------------------------------------------------------------
+      # Audit kebocoran isi mirror (rec #4) — fail-closed.
+      # Hanya berkas yang TER-TRACK yang diperiksa (exclude .github/
+      # karena file workflow ini sendiri memuat pola pencarian).
+      # ------------------------------------------------------------
+      - name: Audit kebocoran mirror (kanonik/secret) — fail-closed
+        id: leakage
+        run: |
+          set -euo pipefail
+          LEAK=0
+          echo "== A. Berkas kanonik/terlarang yang TIDAK boleh ada di mirror =="
+          FORBIDDEN='.gitlab-ci.yml G4_3_ARCHIVE_SHA256.txt PHASE5_REPORT.txt PROJECT_HANDOVER.md .secrets .env rootkey.csv'
+          for f in ${FORBIDDEN}; do
+            if git ls-files --error-unmatch "${f}" >/dev/null 2>&1; then
+              echo "  LEAK: berkas terlarang ter-track: ${f}"; LEAK=1
+            fi
+          done
+          echo "  (selesai; tidak ada output LEAK di atas = bersih)"
+          echo "== B. Pola secret high-signal pada berkas ter-track (exclude .github/) =="
+          HITS="$(git ls-files -z | grep -zv '^\.github/' | xargs -0 -r grep -nIE \
+            'glpat-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY|aws_secret_access_key' \
+            2>/dev/null || true)"
+          if [ -n "${HITS}" ]; then
+            echo "  LEAK: pola secret ditemukan:"; echo "${HITS}" | head -20; LEAK=1
+          else
+            echo "  bersih (0 kecocokan)"
+          fi
+          echo "== C. Jumlah berkas ter-track =="
+          git ls-files | wc -l
+          echo "leak=${LEAK}" >> "${GITHUB_OUTPUT}"
+          if [ "${LEAK}" = "1" ]; then
+            echo "::error::AUDIT MIRROR GAGAL — potensi kebocoran pada repo public"
+          fi
+
+      # ------------------------------------------------------------
+      # Deteksi kegagalan beruntun run coverage (rec #2).
+      # ------------------------------------------------------------
+      - name: Cek run coverage terakhir (N gagal beruntun)
+        id: check
+        uses: actions/github-script@v7
+        env:
+          SIMULATE: ${{ inputs.simulate_failure }}
+          THRESHOLD: ${{ inputs.failure_threshold }}
+        with:
+          script: |
+            const sim = (process.env.SIMULATE || 'false') === 'true';
+            const threshold = parseInt(process.env.THRESHOLD || '2', 10) || 2;
+            const { owner, repo } = context.repo;
+            const res = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'coverage.yml', per_page: 15,
+            });
+            const done = res.data.workflow_runs.filter(r => r.status === 'completed');
+            let consec = 0, lastUrl = '', lastConclusion = '';
+            for (const r of done) {
+              if (r.conclusion === 'success') break;
+              consec++;
+            }
+            if (done.length) {
+              lastUrl = done[0].html_url;
+              lastConclusion = done[0].conclusion || '';
+            }
+            const leak = '${{ steps.leakage.outputs.leak }}' === '1';
+            const failAlert = consec >= threshold;
+            const alert = sim || failAlert || leak;
+            let reason = 'sehat';
+            if (sim) reason = 'SIMULASI (uji alert)';
+            else if (failAlert) reason = `${consec} run coverage GAGAL beruntun (ambang ${threshold})`;
+            else if (leak) reason = 'audit kebocoran mirror GAGAL';
+            core.setOutput('alert', alert ? 'true' : 'false');
+            core.setOutput('consec', String(consec));
+            core.setOutput('threshold', String(threshold));
+            core.setOutput('leak', leak ? 'true' : 'false');
+            core.setOutput('reason', reason);
+            core.setOutput('last_run_url', lastUrl);
+            core.setOutput('last_conclusion', lastConclusion);
+            core.setOutput('total_checked', String(done.length));
+            console.log(`consec=${consec} threshold=${threshold} leak=${leak} sim=${sim} -> alert=${alert} (${reason})`);
+
+      # ------------------------------------------------------------
+      # Alert #1: GitHub Issue (label coverage-alert) — dedupe.
+      # ------------------------------------------------------------
+      - name: Alert GitHub Issue (buka/comment)
+        if: steps.check.outputs.alert == 'true'
+        uses: actions/github-script@v7
+        env:
+          REASON: ${{ steps.check.outputs.reason }}
+          CONSEC: ${{ steps.check.outputs.consec }}
+          LAST_URL: ${{ steps.check.outputs.last_run_url }}
+          LAST_CONC: ${{ steps.check.outputs.last_conclusion }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const reason = process.env.REASON;
+            const body = [
+              '## :rotating_light: ALERT Gate Coverage zef',
+              '',
+              `**Alasan:** ${reason}`,
+              `**Run coverage terakhir:** ${process.env.LAST_CONCLUSION || '-'} — ${process.env.LAST_URL || '-'}`,
+              `**Run gagal beruntun:** ${process.env.CONSEC}`,
+              `**Dipicu oleh monitor:** ${process.env.RUN_URL}`,
+              '',
+              '> GitHub Actions adalah SATU-SATUNYA executor coverage zef dan',
+              '> `coverage-wait` memblokir `main`. Selama alert ini terbuka,',
+              '> merge ke `main` kemungkinan TERBLOKIR.',
+              '',
+              '**Tindakan:** lihat runbook `docs/COVERAGE_RUNBOOK.md`',
+              '(`workflow_dispatch` re-run / eksekusi lokal `:debug` /',
+              'melepas gate sementara dengan aman).',
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'coverage-alert', per_page: 5,
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.data[0].number,
+                body: `Masih ALERT — ${reason} (${new Date().toISOString()})`,
+              });
+              core.notice(`Alert GitHub: comment pada issue #${existing.data[0].number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner, repo,
+                title: ':rotating_light: Gate coverage zef GAGAL — perlu tindakan',
+                body, labels: ['coverage-alert'],
+              });
+              core.notice(`Alert GitHub: issue #${created.data.number} dibuat`);
+            }
+
+      # ------------------------------------------------------------
+      # Alert #2: GitLab Issue di zeflous/zef (label coverage-alert).
+      # ------------------------------------------------------------
+      - name: Alert GitLab Issue (buka/comment)
+        if: steps.check.outputs.alert == 'true'
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          REASON: ${{ steps.check.outputs.reason }}
+          CONSEC: ${{ steps.check.outputs.consec }}
+          LAST_URL: ${{ steps.check.outputs.last_run_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GITLAB_TOKEN:-}" ]; then
+            echo "skip: secret GITLAB_TOKEN tidak tersedia (alert GitHub tetap terkirim)"
+            exit 0
+          fi
+          DESC="$(printf '%s\n' \
+            "**Alasan:** ${REASON}" \
+            "**Run gagal beruntun:** ${CONSEC}" \
+            "**Run coverage terakhir:** ${LAST_URL}" \
+            "**Monitor:** ${RUN_URL}" \
+            "" \
+            "GitHub Actions kini satu-satunya executor coverage zef; \`coverage-wait\` memblokir \`main\`.")"
+          EXIST="$(curl -fsS --max-time 25 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            "${GITLAB_API}/projects/${GITLAB_PROJECT_ID}/issues?labels=coverage-alert&state=opened&per_page=1" 2>/dev/null || echo '[]')"
+          IID="$(printf '%s' "${EXIST}" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["iid"] if d else "")' 2>/dev/null || true)"
+          if [ -n "${IID}" ]; then
+            CODE="$(curl -sS --max-time 25 -o /dev/null -w '%{http_code}' -X POST \
+              -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H "Content-Type: application/json" \
+              "${GITLAB_API}/projects/${GITLAB_PROJECT_ID}/issues/${IID}/notes" \
+              -d "$(python3 -c 'import json,sys;print(json.dumps({"body":"Masih ALERT — "+sys.argv[1]}))' "${REASON}")")"
+            echo "GitLab alert -> comment issue #${IID} (HTTP ${CODE})"
+          else
+            CODE="$(curl -sS --max-time 25 -o /dev/null -w '%{http_code}' -X POST \
+              -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H "Content-Type: application/json" \
+              "${GITLAB_API}/projects/${GITLAB_PROJECT_ID}/issues" \
+              -d "$(python3 -c 'import json,sys;print(json.dumps({"title":":rotating_light: Gate coverage zef GAGAL — perlu tindakan","description":sys.argv[1],"labels":"coverage-alert"}))' "${DESC}")")"
+            echo "GitLab alert -> issue baru dibuat (HTTP ${CODE})"
+          fi
+
+      # ------------------------------------------------------------
+      # Auto-close alert saat sehat kembali (kedua kanal).
+      # ------------------------------------------------------------
+      - name: Tutup alert saat sehat
+        if: steps.check.outputs.alert == 'false'
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          REASON: ${{ steps.check.outputs.reason }}
+        run: |
+          set -uo pipefail
+          # GitHub issues
+          GH_ISSUES="$(curl -fsS --max-time 25 -H "Authorization: token ${GH_TOKEN:-${{ github.token }}}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues?state=open&labels=coverage-alert&per_page=10" 2>/dev/null || echo '[]')"
+          for n in $(printf '%s' "${GH_ISSUES}" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(" ".join(str(i["number"]) for i in d))' 2>/dev/null || true); do
+            curl -sS --max-time 20 -o /dev/null -X PATCH -H "Authorization: token ${{ github.token }}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/${n}" \
+              -d '{"state":"closed","state_reason":"completed"}' || true
+            echo "GitHub alert issue #${n} ditutup (sehat kembali)"
+          done
+          # GitLab issues
+          if [ -n "${GITLAB_TOKEN:-}" ]; then
+            IIDS="$(curl -fsS --max-time 25 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+              "${GITLAB_API}/projects/${GITLAB_PROJECT_ID}/issues?labels=coverage-alert&state=opened&per_page=10" 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin);print(" ".join(str(i["iid"]) for i in d))' 2>/dev/null || true)"
+            for i in ${IIDS}; do
+              curl -sS --max-time 25 -o /dev/null -X PUT -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+                "${GITLAB_API}/projects/${GITLAB_PROJECT_ID}/issues/${i}?state_event=close" || true
+              echo "GitLab alert issue #${i} ditutup (sehat kembali)"
+            done
+          fi
+
+      - name: Ringkasan
+        if: always()
+        run: |
+          {
+            echo "## Coverage gate monitor"
+            echo "- alert: \`${{ steps.check.outputs.alert }}\`"
+            echo "- alasan: ${{ steps.check.outputs.reason }}"
+            echo "- run gagal beruntun: ${{ steps.check.outputs.consec }} (ambang ${{ steps.check.outputs.threshold }})"
+            echo "- audit kebocoran mirror: ${{ steps.leakage.outputs.leak == '1' && 'GAGAL' || 'bersih' }}"
+            echo "- run coverage terakhir: ${{ steps.check.outputs.last_run_url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Kegagalan monitor = sinyal tambahan (notifikasi email GitHub).
+      - name: Gagalkan monitor bila ALERT (sinyal tambahan)
+        if: steps.check.outputs.alert == 'true'
+        run: |
+          echo "ALERT aktif: ${{ steps.check.outputs.reason }}"
+          echo "::error::Coverage gate ALERT — lihat issue berlabel coverage-alert"
+          exit 1
