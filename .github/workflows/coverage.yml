@@ -66,23 +66,26 @@ jobs:
             composer-${{ runner.os }}-
 
       # PARITAS INSTRUMENTASI (Tahap 2 migrasi kanonik).
-      # Dulu: `coverage: xdebug` -> setup-php mengambil versi "latest" dari PECL/
-      # GitHub = Xdebug 3.6.0alpha1 (pre-release; GH menandainya
-      # prerelease=false sehingga ikut terpilih) tanggal 2026-09-08, sementara
-      # image CI GitLab :debug memakai Xdebug STABIL 3.5.3. Driver coverage
-      # beda versi = denominator branch bergeser -> kriteria paritas P1–P12
-      # TIDAK SAH ditetapkan. Perbaikan: (1) `coverage: none` supaya setup-php
-      # tidak memasang driver "latest"; (2) pin eksplisit lewat input
-      # `extensions: xdebug-<versi>` (sintaks semver -> add_pecl_extension
-      # xdebug 3.5.3 zend_extension); (3) APCu & Redis dinonaktifkan agar sama
-      # dengan image GitLab (keduanya absen di sana -> test terkait di-SKIP).
-      # Rujukan: shivammathur/setup-php src/extensions.ts (regex semver) &
-      # src/coverage.ts (addCoverageXdebug memakai addExtension tanpa versi).
+      # Dulu: `coverage: xdebug` -> setup-php memasang driver "latest" = Xdebug
+      # 3.6.0alpha1 (pre-release; GH menandainya prerelease=false sehingga ikut
+      # terpilih) rilis 2026-09-08, sementara image CI GitLab :debug memakai
+      # Xdebug STABIL 3.5.3. Driver coverage beda versi = denominator branch
+      # bergeser -> kriteria paritas P1–P12 TIDAK SAH ditetapkan.
+      #
+      # Input `coverage:` SENGAJA TIDAK DIPAKAI (dan pernah salah): `coverage: none`
+      # memicu langkah "Setup Coverage" -> disable_all_shared yang berjalan SETELAH
+      # instalasi ekstensi, sehingga Xdebug yang baru dipasang ikut dimatikan
+      # (terbukti: run 34501898050 -> "none Disabled Xdebug and PCOV" lalu
+      # "MISSING XDEBUG"). Tanpa input `coverage:`, setup-php tidak menyentuh driver
+      # sama sekali. Rujukan: setup-php src/coverage.ts `case 'none': disable_all_shared`.
+      #
+      # Xdebug di-pin eksplisit via `extensions:` (sintaks semver -> PECL):
+      #   xdebug-3.5.3  = pasang 3.5.3 + enable sebagai zend_extension
+      #   :apcu, :redis = NONAKTIFKAN (paritas image GitLab yang tidak memuatnya)
       - name: Setup PHP 8.4 + Xdebug ${{ env.XDEBUG_PIN }} (pinned, paritas image GitLab CI :debug)
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          coverage: none
           extensions: xdebug-${{ env.XDEBUG_PIN }}, :apcu, :redis
           tools: composer:v2
           ini-values: memory_limit=${{ env.PHP_MEMORY_LIMIT }}
