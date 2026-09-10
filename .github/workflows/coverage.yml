@@ -6,7 +6,8 @@
 # job coverage branch.
 #
 # PARITAS 1:1 dengan job `coverage` di .gitlab-ci.yml zeflous/zef:
-#   - PHP 8.4 + Xdebug (mode=coverage) + composer install dari composer.lock
+#   - PHP 8.4 + Xdebug 3.5.3 TER-PIN (mode=coverage) + composer install dari composer.lock
+#     (pin = versi image CI GitLab :debug; lihat env XDEBUG_PIN + assert fail-closed)
 #   - phpunit --configuration phpunit.xml.dist --coverage-clover / --coverage-text
 #     (phpunit.xml.dist memuat <coverage pathCoverage="true"> -> branch coverage)
 #   - verifikasi clover: test -s var/coverage/coverage.xml
@@ -37,6 +38,13 @@ env:
   # ruang utk OS + Xdebug branch collection (anti OOM; GitLab OOM pada cgroup
   # ~3.5G, runner ini ~7G). Line-only di GitLab memakai 1024M; branch butuh lebih.
   PHP_MEMORY_LIMIT: "6144M"
+  # PARITAS INSTRUMENTASI (Tahap 2 migrasi kanonik): versi Xdebug TUNGGAL
+  # sumber-kebenaran. Dipakai oleh (a) pin `extensions: xdebug-<versi>` dan
+  # (b) assert fail-closed di step "Verify PHP + Xdebug". Nilai HARUS sama
+  # dengan image CI GitLab (${CI_IMAGE_BASE}:debug) — trace job 16390937176
+  # menunjukkan "Xdebug OK: 3.5.3". Naikkan pin HANYA setelah image GitLab
+  # naik versi (kalau tidak, denominator branch coverage bergeser).
+  XDEBUG_PIN: "3.5.3"
 
 jobs:
   coverage:
@@ -57,38 +65,72 @@ jobs:
           restore-keys: |
             composer-${{ runner.os }}-
 
-      - name: Setup PHP 8.4 + Xdebug (coverage)
+      # PARITAS INSTRUMENTASI (Tahap 2 migrasi kanonik).
+      # Dulu: `coverage: xdebug` -> setup-php mengambil versi "latest" dari PECL/
+      # GitHub = Xdebug 3.6.0alpha1 (pre-release; GH menandainya
+      # prerelease=false sehingga ikut terpilih) tanggal 2026-09-08, sementara
+      # image CI GitLab :debug memakai Xdebug STABIL 3.5.3. Driver coverage
+      # beda versi = denominator branch bergeser -> kriteria paritas P1–P12
+      # TIDAK SAH ditetapkan. Perbaikan: (1) `coverage: none` supaya setup-php
+      # tidak memasang driver "latest"; (2) pin eksplisit lewat input
+      # `extensions: xdebug-<versi>` (sintaks semver -> add_pecl_extension
+      # xdebug 3.5.3 zend_extension); (3) APCu & Redis dinonaktifkan agar sama
+      # dengan image GitLab (keduanya absen di sana -> test terkait di-SKIP).
+      # Rujukan: shivammathur/setup-php src/extensions.ts (regex semver) &
+      # src/coverage.ts (addCoverageXdebug memakai addExtension tanpa versi).
+      - name: Setup PHP 8.4 + Xdebug ${{ env.XDEBUG_PIN }} (pinned, paritas image GitLab CI :debug)
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          coverage: xdebug
+          coverage: none
+          extensions: xdebug-${{ env.XDEBUG_PIN }}, :apcu, :redis
           tools: composer:v2
           ini-values: memory_limit=${{ env.PHP_MEMORY_LIMIT }}
         env:
           fail-fast: true
 
-      - name: Verify PHP + Xdebug (fail-closed)
+      # ASSERT FAIL-CLOSED instrumentasi: versi Xdebug HARUS persis sama dengan
+      # pin (paritas image GitLab). Kalau setup-php kelak mengembalikan driver
+      # "latest" (mis. alpha baru), run ini MERAH — bukan diam-diam drift.
+      # Ini guard P6/P10 (digest & versi instrumen identik).
+      - name: Verify PHP + Xdebug (fail-closed, pin 1:1 dgn GitLab)
         run: |
+          set -euo pipefail
           php --version
-          php -r 'if (!extension_loaded("xdebug")) { fwrite(STDERR, "MISSING XDEBUG - setup-php gagal" . PHP_EOL); exit(1); } echo "Xdebug OK: " . phpversion("xdebug") . PHP_EOL;'
+          php -r '
+            $pin = getenv("XDEBUG_PIN");
+            if (!extension_loaded("xdebug")) { fwrite(STDERR, "MISSING XDEBUG - setup-php gagal" . PHP_EOL); exit(1); }
+            $have = phpversion("xdebug");
+            echo "Xdebug OK: " . $have . " (pin: " . $pin . ")" . PHP_EOL;
+            if ($have !== $pin) { fwrite(STDERR, "XDEBUG DRIFT: terpasang " . $have . " != pin " . $pin . " (paritas GitLab <-> GitHub rusak)" . PHP_EOL); exit(1); }
+          '
 
-      # PARITAS dengan image CI GitLab (Dockerfile.ci): image tsb TIDAK memuat
-      # APCu, sehingga test ApcuRateLimiter* di-SKIP (sama seperti GitLab).
-      # Runner GitHub kebetulan punya APCu aktif -> test yang sama JALAN dan
-      # gagal (expectation window-reset tidak cocok dgn fixed-window impl).
-      # Nonaktifkan APCu agar perilaku suite identik dgn GitLab CI.
-      - name: Disable APCu (paritas image GitLab CI - apcu tests skipped)
+      # PARITAS dengan image CI GitLab (Dockerfile.ci stage `base`): image tsb
+      # TIDAK memuat APCu MAUPUN ext-redis. Akibatnya di GitLab 16 test di-SKIP
+      # (junit job 16426467514: Batch9ApcuRateLimiterTest 4 + RateLimiterDetailedTest
+      # 7 APCu/Redis + G4_2_OTLPBoundaryIntegrationTest 2). Di runner GitHub
+      # default, ext-redis SUDAH ter-bundel (APCu sudah ditangani) -> 7 test Redis
+      # JALAN di GitHub tapi SKIP di GitLab = |Δskip| 7 (bukan jumlah test, yang
+      # sudah 934 = 934). Nonaktifkan KEDUANYA agar perilaku suite identik.
+      # Assert fail-closed: kalau salah satu extension tetap aktif, run MERAH.
+      - name: Disable APCu + Redis (paritas image GitLab CI - test terkait SKIP)
         run: |
           set -e
           INI_DIR=$(php --ini | awk -F': ' '/Scan for additional .ini files/ {print $2}' | tr -d ' ')
           if [ -n "$INI_DIR" ] && [ -d "$INI_DIR" ]; then
-            ls "$INI_DIR" | grep -qi apcu && sudo rm -f "$INI_DIR"/*apcu* || true
+            ls "$INI_DIR" | grep -qiE 'apcu|redis' && sudo rm -f "$INI_DIR"/*apcu* "$INI_DIR"/*redis* || true
           fi
           MAIN_INI=$(php --ini | awk -F': ' '/Loaded Configuration File/ {print $2}' | tr -d ' ')
           if [ -n "$MAIN_INI" ] && [ -f "$MAIN_INI" ]; then
-            sudo sed -i '/^extension[[:space:]]*=[[:space:]]*apcu/d;/^extension[[:space:]]*=[[:space:]]*"apcu/d' "$MAIN_INI" || true
+            sudo sed -i '/^extension[[:space:]]*=[[:space:]]*"\?apcu/d;/^extension[[:space:]]*=[[:space:]]*"\?redis/d' "$MAIN_INI" || true
           fi
-          php -r 'echo "apcu_fetch available after disable: "; var_export(function_exists("apcu_fetch")); echo PHP_EOL;'
+          php -r '
+            $apcu = function_exists("apcu_fetch");
+            $redis = extension_loaded("redis");
+            echo "apcu_fetch available after disable: "; var_export($apcu); echo PHP_EOL;
+            echo "ext-redis loaded after disable: "; var_export($redis); echo PHP_EOL;
+            if ($apcu || $redis) { fwrite(STDERR, "PARITAS RUSAK: extension yang absen di image GitLab masih aktif (apcu=" . var_export($apcu, true) . ", redis=" . var_export($redis, true) . ")" . PHP_EOL); exit(1); }
+          '
 
       - name: Composer install (lock 1:1)
         run: composer install --prefer-dist --no-progress --no-interaction --no-scripts --optimize-autoloader
