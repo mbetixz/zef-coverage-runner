@@ -35,7 +35,11 @@
  *   --gh-api=URL        (default https://api.github.com)
  *   --branch=NAME       (default main)
  *   --max=N             maksimum commit diperiksa (default 20)
- *   --sample-days=N     batasi commit ke N hari terakhir (default 14; 0 = tanpa batas)
+ *   --sample-days=N     batasi commit ke N hari terakhir (default 30; 0 = tanpa batas)
+ *   --baseline=SHA      jendela teranchored: periksa hanya commit dari HEAD sampai baseline
+ *                       (inklusif). Menggantikan sample-days bila SHA ditemukan; bila tidak
+ *                       ditemukan, jatuh ke sample-days + peringatan. Dipakai agar gate
+ *                       mengukur jendela PASCA-ratifikasi baseline, bukan commit historis.
  *   --line-tol=F        toleransi absolut line coverage % (default 0.0)
  *   --branch-tol=F      toleransi absolut branch coverage % (default 0.0)
  *   --tests-tol=N       toleransi selisih jumlah test (default 0)
@@ -55,10 +59,11 @@ const EXIT_ERROR = 2;
 
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
-    'line_tol'    => 0.0,
-    'branch_tol'  => 0.0,
-    'tests_tol'   => 0,
-    'sample_days' => 14,
+    'line_tol'     => 0.0,
+    'branch_tol'   => 0.0,
+    'tests_tol'    => 0,
+    'duration_tol' => 0.0, // P11: 0 = INFORMASIONAL (durasi bergantung lingkungan; tidak pernah jadi pelanggaran). Set > 0 untuk menegakkan.
+    'sample_days'  => 30,
 ];
 
 // Instrumen yang HARUS identik di kedua sisi (P10).
@@ -91,11 +96,16 @@ $max       = max(1, (int) $opt('max', 20));
 $outDir    = (string) $opt('out-dir', 'docs/parity');
 $noWrite   = (bool) $opt('no-write', false);
 $compact   = (bool) $opt('compact', false);
+// --strict-numeric: naikkan dimensi numerik yang belum terukur (n/a) menjadi ERROR.
+// Default OFF agar gate tetap hijau selama job `coverage` GitLab belum kembali (Tahap 3c).
+$strictNumeric = (bool) $opt('strict-numeric', false);
+$baseline = (string) $opt('baseline', '');
 
 $POLICY['line_tol']    = (float) $opt('line-tol', $POLICY['line_tol']);
 $POLICY['branch_tol']  = (float) $opt('branch-tol', $POLICY['branch_tol']);
 $POLICY['tests_tol']   = (int) $opt('tests-tol', $POLICY['tests_tol']);
 $POLICY['sample_days'] = (int) $opt('sample-days', $POLICY['sample_days']);
+$POLICY['duration_tol'] = (float) $opt('duration-tol', $POLICY['duration_tol']);
 
 $glToken = (string) ($opt('gl-token') ?: getenv('GL_TOKEN') ?: getenv('GITLAB_TOKEN') ?: '');
 $ghToken = (string) ($opt('gh-token') ?: getenv('GITHUB_TOKEN') ?: getenv('GH_TOKEN') ?: '');
@@ -118,27 +128,69 @@ if ($glToken === '' || $ghToken === '') {
  */
 function http(string $url, array $headers = [], ?string $postBody = null, int $timeout = 25): array
 {
-    $opts = [
-        'http' => [
-            'method'        => $postBody === null ? 'GET' : 'POST',
-            'header'        => implode("\r\n", $headers),
-            'timeout'       => $timeout,
-            'ignore_errors' => true,
-            'follow_location' => 1,
-            'max_redirects' => 5,
-        ],
-    ];
-    if ($postBody !== null) {
-        $opts['http']['content'] = $postBody;
-    }
-    $ctx = stream_context_create($opts);
-    $body = @file_get_contents($url, false, $ctx);
+    $originHost = strtolower((string) (parse_url($url, PHP_URL_HOST) ?? ''));
+    $currentUrl = $url;
+    $body = false;
     $code = 0;
-    foreach ($http_response_header ?? [] as $h) {
-        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) {
-            $code = (int) $m[1];
+    $redirectsLeft = 5;
+
+    // Redirect ditangani MANUAL (follow_location=0). PHP stream wrapper — berbeda dari
+    // curl — MENERUSKAN header kustom ke host tujuan redirect; unduhan log GitHub
+    // Actions mengalihkan ke S3 (URL pre-signed) yang MENOLAK header Authorization
+    // (403 AuthenticationFailed). Karena itu permintaan lintas-host diulang TANPA
+    // header kredensial. Header hanya dikirim ke host asal (origin), tidak pernah bocor.
+    do {
+        $p = parse_url($currentUrl);
+        $requestHeaders = $headers;
+        if (strtolower((string) ($p['host'] ?? '')) !== $originHost) {
+            $requestHeaders = [];
+            foreach ($headers as $h) {
+                if (!preg_match('/^(authorization|private-token|token)\s*:/i', $h)) {
+                    $requestHeaders[] = $h;
+                }
+            }
         }
-    }
+        $opts = [
+            'http' => [
+                'method'          => $postBody === null ? 'GET' : 'POST',
+                'header'          => implode("\r\n", $requestHeaders),
+                'timeout'         => $timeout,
+                'ignore_errors'   => true,
+                'follow_location' => 0,
+                'max_redirects'   => 0,
+            ],
+        ];
+        if ($postBody !== null) {
+            $opts['http']['content'] = $postBody;
+        }
+        $ctx = stream_context_create($opts);
+        $body = @file_get_contents($currentUrl, false, $ctx);
+        $code = 0;
+        $location = '';
+        foreach ($http_response_header ?? [] as $h) {
+            if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) {
+                $code = (int) $m[1];
+            }
+            if (preg_match('#^location:\s*(.+)$#i', $h, $m)) {
+                $location = trim($m[1]);
+            }
+        }
+        if ($code >= 300 && $code < 400 && $location !== '' && $redirectsLeft > 0) {
+            $scheme = (string) ($p['scheme'] ?? 'https');
+            if (strpos($location, '//') === 0) {
+                $location = $scheme . ':' . $location;
+            } elseif (strpos($location, '/') === 0) {
+                $location = $scheme . '://' . ($p['host'] ?? '') . $location;
+            } elseif (strpos($location, '://') === false) {
+                $location = $scheme . '://' . ($p['host'] ?? '') . '/' . ltrim($location, '/');
+            }
+            $currentUrl = $location;
+            $redirectsLeft--;
+            continue;
+        }
+        break;
+    } while (true);
+
     return ['code' => $code, 'body' => $body === false ? '' : $body];
 }
 
@@ -155,6 +207,70 @@ function ghHeaders(string $token): array
 function glHeaders(string $token): array
 {
     return ['PRIVATE-TOKEN: ' . $token, 'Accept: application/json'];
+}
+
+/** Header API GitHub (JSON) — dipakai seluruh GET API (runs, jobs, commits, contents). */
+function ghApiHeaders(string $token): array
+{
+    return [
+        'Authorization: token ' . $token,
+        'Accept: application/vnd.github+json',
+        'User-Agent: zef-parity-check',
+        'X-GitHub-Api-Version: 2022-11-28',
+    ];
+}
+
+/** Bersihkan artefak log mentah (UTF-8 BOM, escape ANSI, CR) agar regex angka stabil. */
+function cleanLog(string $raw): string
+{
+    $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw) ?? $raw;
+    $raw = preg_replace('/\x1B\[[0-9;]*[A-Za-z]/', '', $raw) ?? $raw;
+    return str_replace("\r", '', $raw);
+}
+
+/**
+ * Unduh LOG job Actions sebagai teks biasa.
+ * PENTING: endpoint ini mengalihkan (302) ke S3 dan URL pre-signed MENOLAK header
+ * Authorization — pembuangan header lintas-host ditangani http().
+ */
+function ghJobLog(string $ghApi, string $repo, string $jobId, string $ghToken): string
+{
+    $r = http("{$ghApi}/repos/{$repo}/actions/jobs/" . rawurlencode($jobId) . '/logs', ghApiHeaders($ghToken), null, 60);
+    if ($r['code'] < 200 || $r['code'] >= 300 || $r['body'] === '') {
+        return '';
+    }
+    return cleanLog($r['body']);
+}
+
+/**
+ * Status job `coverage-offload` pada pipeline COMMIT yang diperiksa.
+ * Dipakai untuk MEMBEDAKAN (a) commit yang pipeline-nya tidak pernah mencapai tahap
+ * mirror-push — paritas vakum, bukan lulus diam-diam — dari (b) INVARIANT BREACH:
+ * mirror sudah ter-push (offload success) tetapi run/status GitHub tidak ada ⇒ data
+ * tidak lengkap yang WAJIB menjadi error. Tanpa pembeda ini, keduanya jatuh ke
+ * "INCOMPLETE" yang sama dan gate menjadi terlalu bising untuk commit uji-yang-gagal.
+ * @return string salah satu: success|failed|canceled|skipped|manual|none
+ */
+function glOffloadStatus(string $glApi, string $glq, string $branch, string $glToken, string $sha): string
+{
+    $res = resolveGlPipelines($glApi, $glq, $branch, $glToken, $sha);
+    $best = 'none';
+    foreach ($res['pids'] as $pid) {
+        $jobs = jsonGet("{$glApi}/projects/{$glq}/pipelines/" . (int) $pid . '/jobs?per_page=100', glHeaders($glToken), 30);
+        foreach (($jobs ?? []) as $j) {
+            if ((string) ($j['name'] ?? '') !== 'coverage-offload') {
+                continue;
+            }
+            $st = (string) ($j['status'] ?? '');
+            if ($st === 'success') {
+                return 'success';
+            }
+            if ($best === 'none' && $st !== '') {
+                $best = $st;
+            }
+        }
+    }
+    return $best;
 }
 
 /**
@@ -277,12 +393,220 @@ function instrumentDigest(string $path, string $side, string $ref, string $glApi
     return sha256Remote($url, $headers);
 }
 
+/**
+ * Ekstrak angka test/skipped + versi runtime dari teks (log/trace) salah satu sisi.
+ * Fallback: baris `PHP x.y.z` (mis. `php --version`) bila pola `Runtime: PHP ... with Xdebug` absen.
+ * @return array{tests:?int,skipped:?int,php:?string,xdebug:?string}
+ */
+function extractNumbers(string $txt): array
+{
+    $u = parsePhpunitSummary($txt);
+    if ($u['php'] === null && preg_match('/\bPHP\s+(\d+\.\d+\.\d+)/', $txt, $m)) {
+        $u['php'] = $m[1];
+    }
+    if ($u['xdebug'] === null && preg_match('/Xdebug\s+v?([0-9][0-9A-Za-z.\-]*)/', $txt, $m)) {
+        $u['xdebug'] = $m[1];
+    }
+    return ['tests' => $u['tests'], 'skipped' => $u['skipped'], 'php' => $u['php'], 'xdebug' => $u['xdebug']];
+}
+
+/**
+ * Metrik sisi GitHub: ambil job pertama pada run, durasi, lalu log job (plain).
+ * @return array<string,mixed>
+ */
+function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToken): array
+{
+    $out = [
+        'tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null,
+        'lines_pct' => null, 'lines_covered' => null, 'lines_total' => null,
+        'branches_pct' => null, 'branches_covered' => null, 'branches_total' => null,
+        'duration_s' => null,
+    ];
+    if ($runId === '') {
+        return $out;
+    }
+    $jobs = jsonGet("{$ghApi}/repos/{$repo}/actions/runs/" . rawurlencode($runId) . '/jobs?per_page=20', ghHeaders($ghToken), 30);
+    if (!is_array($jobs) || (($jobs['jobs'] ?? []) === [])) {
+        return $out;
+    }
+    $job = $jobs['jobs'][0];
+    if (!empty($job['started_at']) && !empty($job['completed_at'])) {
+        $out['duration_s'] = max(0, (int) strtotime((string) $job['completed_at']) - (int) strtotime((string) $job['started_at']));
+    }
+    $jobId = (string) ($job['id'] ?? '');
+    if ($jobId === '') {
+        return $out;
+    }
+    $txt = ghJobLog($ghApi, $repo, $jobId, $ghToken);
+    if ($txt === '') {
+        return $out;
+    }
+    $n = extractNumbers($txt);
+    $out['tests'] = $n['tests'];
+    $out['skipped'] = $n['skipped'];
+    $out['php'] = $n['php'];
+    $out['xdebug'] = $n['xdebug'];
+    $g = parseGateText($txt);
+    foreach (['lines_pct', 'lines_covered', 'lines_total', 'branches_pct', 'branches_covered', 'branches_total'] as $k) {
+        $out[$k] = $g[$k];
+    }
+    return $out;
+}
+
+/**
+ * Resolusi pipeline GitLab untuk SATU commit (bukan pipeline terakhir branch).
+ * KORELASI PER-COMMIT (regresi G0-3): `pipelines?ref=<branch>` mengembalikan pipeline
+ * TERBARU branch untuk SETIAP baris sehingga baris historis dibandingkan dengan data
+ * commit terbaru → positif-palsu (mis. P2 skipped 9 vs 16). `pipelines?sha=<sha>` mengikat
+ * pengukuran ke commit yang sedang dibandingkan. Bila sha diberikan tetapi tidak ada
+ * pipeline yang cocok, hasilnya kosong (TIDAK jatuh ke pipeline branch lain).
+ * @return array{pids:array<int,int>,sha_scoped:bool}
+ */
+function resolveGlPipelines(string $glApi, string $glq, string $branch, string $glToken, string $sha): array
+{
+    if ($sha !== '') {
+        $pls = jsonGet("{$glApi}/projects/{$glq}/pipelines?sha=" . rawurlencode($sha) . '&per_page=10', glHeaders($glToken), 30);
+        $pids = [];
+        foreach (($pls ?? []) as $p) {
+            // utamakan pipeline branch kanonik; toleransi ref lain (mis. refs/merge-requests)
+            if ((string) ($p['ref'] ?? '') === $branch) {
+                array_unshift($pids, (int) ($p['id'] ?? 0));
+            } else {
+                $pids[] = (int) ($p['id'] ?? 0);
+            }
+        }
+        return ['pids' => array_values(array_filter($pids)), 'sha_scoped' => true];
+    }
+    $pls = jsonGet("{$glApi}/projects/{$glq}/pipelines?ref=" . rawurlencode($branch) . '&per_page=5', glHeaders($glToken), 30);
+    $pids = [];
+    foreach (($pls ?? []) as $p) {
+        $pids[] = (int) ($p['id'] ?? 0);
+    }
+    return ['pids' => array_values(array_filter($pids)), 'sha_scoped' => false];
+}
+
+/**
+ * Metrik sisi GitLab: job `phpunit` pada pipeline COMMIT yang dibandingkan (trace + durasi).
+ * @return array<string,mixed>
+ */
+function glRunMetrics(string $glApi, string $glq, string $branch, string $glToken, string $jobName = 'phpunit', string $sha = ''): array
+{
+    static $cache = [];
+    $ck = $jobName . '|' . $branch . '|' . $sha;
+    if (isset($cache[$ck])) {
+        return $cache[$ck];
+    }
+    return $cache[$ck] = glRunMetricsUncached($glApi, $glq, $branch, $glToken, $jobName, $sha);
+}
+
+/** @return array<string,mixed> */
+function glRunMetricsUncached(string $glApi, string $glq, string $branch, string $glToken, string $jobName, string $sha = ''): array
+{
+    $out = ['tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null, 'duration_s' => null];
+    $res = resolveGlPipelines($glApi, $glq, $branch, $glToken, $sha);
+    if ($res['pids'] === []) {
+        return $out;
+    }
+    $pid = (int) $res['pids'][0];
+    if ($pid === 0) {
+        return $out;
+    }
+    $jobs = jsonGet("{$glApi}/projects/{$glq}/pipelines/{$pid}/jobs?per_page=100", glHeaders($glToken), 30);
+    $job = null;
+    foreach (($jobs ?? []) as $j) {
+        if (($j['name'] ?? '') === $jobName) {
+            $job = $j;
+            break;
+        }
+    }
+    if (!is_array($job)) {
+        return $out;
+    }
+    if (isset($job['duration']) && $job['duration'] !== null) {
+        $out['duration_s'] = (int) round((float) $job['duration']);
+    }
+    $trace = http("{$glApi}/projects/{$glq}/jobs/" . rawurlencode((string) ($job['id'] ?? '')) . '/trace', glHeaders($glToken), null, 60);
+    $txt = ($trace['code'] >= 200 && $trace['code'] < 300) ? cleanLog($trace['body']) : '';
+    if ($txt === '') {
+        return $out;
+    }
+    $n = extractNumbers($txt);
+    return ['tests' => $n['tests'], 'skipped' => $n['skipped'], 'php' => $n['php'], 'xdebug' => $n['xdebug'], 'duration_s' => $out['duration_s']];
+}
+
+/**
+ * Metrik coverage SISI GITLAB (P3-P7). Sumbernya job `coverage-wait` (stage qualification),
+ * yang mencatat output gate GitHub VERBATIM ke trace-nya ("COVERAGE GATE GITHUB: ...")
+ * setelah memverifikasi run GitHub untuk mirror commit. Job `coverage` lama sudah dihapus
+ * pada Fase 5 sehingga `coverage-wait` adalah sumber kanonik sisi GitLab.
+ * Bila salah satu sisi tidak menyediakan angka, dimensi dilaporkan `n/a` — bukan lulus diam-diam.
+ * @return array<string,float|int>|null
+ */
+function glCoverageMetrics(string $glApi, string $glq, string $branch, string $glToken, string $sha = ''): ?array
+{
+    static $cache = [];
+    $ck = $branch . '|' . $sha;
+    if (array_key_exists($ck, $cache)) {
+        return $cache[$ck];
+    }
+    return $cache[$ck] = glCoverageMetricsUncached($glApi, $glq, $branch, $glToken, $sha);
+}
+
+/** @return array<string,float|int>|null */
+function glCoverageMetricsUncached(string $glApi, string $glq, string $branch, string $glToken, string $sha): ?array
+{
+    $res = resolveGlPipelines($glApi, $glq, $branch, $glToken, $sha);
+    foreach ($res['pids'] as $pid) {
+        $jobs = jsonGet("{$glApi}/projects/{$glq}/pipelines/" . (int) $pid . '/jobs?per_page=100', glHeaders($glToken), 30);
+        foreach (($jobs ?? []) as $j) {
+            $nm = (string) ($j['name'] ?? '');
+            if ($nm !== 'coverage-wait') {
+                continue;
+            }
+            $trace = http("{$glApi}/projects/{$glq}/jobs/" . rawurlencode((string) ($j['id'] ?? '')) . '/trace', glHeaders($glToken), null, 60);
+            $txt = ($trace['code'] >= 200 && $trace['code'] < 300) ? cleanLog($trace['body']) : '';
+            if ($txt === '') {
+                continue;
+            }
+            $g = parseGateText($txt);
+            if ($g['lines_total'] !== null) {
+                return $g;
+            }
+        }
+    }
+    return null;
+}
+
 $rows = [];
 $violations = [];
+
+// Jendela teranchored ke baseline (opsional). Commit tiba terbaru-dulu; jendela =
+// indeks 0..indeks(baseline). Bila baseline tidak ada di antara commit yang diambil
+// (butuh --max cukup besar), jatuh ke jendela sample-days dengan peringatan.
+$windowEnd = null;
+if ($baseline !== '') {
+    $bl = substr($baseline, 0, 8);
+    foreach ($commits as $i => $c) {
+        if (strpos((string) ($c['id'] ?? ''), $bl) === 0) {
+            $windowEnd = $i;
+            break;
+        }
+    }
+    if ($windowEnd === null) {
+        fwrite(STDERR, "WARN: baseline {$bl} tidak ditemukan dalam {$max} commit terakhir → memakai jendela sample-days\n");
+    } elseif (!$compact) {
+        echo "  jendela baseline: HEAD .. {$bl} (inklusif, " . ($windowEnd + 1) . " commit)\n";
+    }
+}
 $operationalErrors = 0;
+$vacuous = 0;  // commit tanpa dual-run (pipeline tak mencapai offload) — vakum, dilaporkan eksplisit
+$numericNA = [];  // dimensi paritas numerik yang belum terukur pada tahap ini (dilaporkan, bukan pelanggaran)
 $checked = 0;
 
-foreach ($commits as $c) {
+foreach ($commits as $idx => $c) {
+    if ($windowEnd !== null && $idx > $windowEnd) {
+        break; // di luar jendela baseline
+    }
     $glSha = (string) ($c['id'] ?? '');
     if ($glSha === '') {
         continue;
@@ -290,8 +614,8 @@ foreach ($commits as $c) {
     $short = substr($glSha, 0, 8);
     $createdAt = (string) ($c['created_at'] ?? '');
     $ts = $createdAt !== '' ? (int) strtotime($createdAt) : 0;
-    if ($cutoff > 0 && $ts > 0 && $ts < $cutoff) {
-        continue; // di luar jendela sampel
+    if ($windowEnd === null && $cutoff > 0 && $ts > 0 && $ts < $cutoff) {
+        continue; // di luar jendela sampel (hanya saat tidak memakai jendela baseline)
     }
     $checked++;
 
@@ -390,12 +714,135 @@ foreach ($commits as $c) {
         }
     }
 
-    // --- Hasil baris
+    // -----------------------------------------------------------------------
+    // P1/P2/P3/P4/P5/P6/P7/P9/P11 — paritas numerik (HARD assertions).
+    //   Sumber GitHub : log job Actions untuk run pada P8 (tests/skipped/runtime/coverage/durasi).
+    //   Sumber GitLab : trace job `phpunit` pipeline terakhir branch kanonik (tests/skipped/runtime/durasi)
+    //                   + job coverage GitLab bila ada (P3-P7).
+    //   Dimensi yang belum punya data di salah satu sisi ditandai `n/a` — DILAPORKAN, bukan lulus
+    //   diam-diam; naikkan ke ERROR lewat --strict-numeric (disarankan aktif pada Tahap 3c).
+    // -----------------------------------------------------------------------
+    $glm = glRunMetrics($glApi, $glq, $branch, $glToken, 'phpunit', $glSha);
+    $ghm = [
+        'tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null,
+        'lines_pct' => null, 'lines_covered' => null, 'lines_total' => null,
+        'branches_pct' => null, 'branches_covered' => null, 'branches_total' => null,
+        'duration_s' => null,
+    ];
+    if ($row['gh_run_id'] !== '') {
+        $ghm = ghRunMetrics($ghApi, $repo, $row['gh_run_id'], $ghToken);
+    }
+    $row['tests']   = $glm['tests'] ?? '';
+    $row['skipped'] = $glm['skipped'] ?? '';
+    $row['php']     = $glm['php'] ?? '';
+    $row['xdebug']  = $glm['xdebug'] ?? '';
+
+    $numNA = [];
+
+    // P1 — jumlah test dieksekusi harus identik.
+    if ($glm['tests'] !== null && $ghm['tests'] !== null) {
+        if (abs((int) $glm['tests'] - (int) $ghm['tests']) > $POLICY['tests_tol']) {
+            $violations[] = "P1 {$short}: tests GitLab={$glm['tests']} <> GitHub={$ghm['tests']} (tol {$POLICY['tests_tol']})";
+        }
+    } else {
+        $numNA[] = 'P1';
+    }
+
+    // P2 — jumlah skipped identik (paritas tingkat jumlah; himpunan nama skip butuh artifact).
+    if ($glm['skipped'] !== null && $ghm['skipped'] !== null) {
+        if ((int) $glm['skipped'] !== (int) $ghm['skipped']) {
+            $violations[] = "P2 {$short}: skipped GitLab={$glm['skipped']} <> GitHub={$ghm['skipped']}";
+        }
+    } else {
+        $numNA[] = 'P2';
+    }
+
+    // P9 — versi runtime PHP/Xdebug identik (Xdebug dibandingkan hanya bila kedua sisi menyediakannya).
+    if ($glm['php'] !== null && $ghm['php'] !== null) {
+        if ((string) $glm['php'] !== (string) $ghm['php']) {
+            $violations[] = "P9 {$short}: PHP GitLab={$glm['php']} <> GitHub={$ghm['php']}";
+        }
+        if ($glm['xdebug'] !== null && $ghm['xdebug'] !== null && (string) $glm['xdebug'] !== (string) $ghm['xdebug']) {
+            $violations[] = "P9 {$short}: Xdebug GitLab={$glm['xdebug']} <> GitHub={$ghm['xdebug']}";
+        }
+    } else {
+        $numNA[] = 'P9';
+    }
+
+    // P3/P4/P5/P6/P7 — coverage line & branch (persen, pembilang, penyebut) GitLab <-> GitHub.
+    $glCoverage = glCoverageMetrics($glApi, $glq, $branch, $glToken, $glSha);
+    $covPairs = [];
+    if ($glCoverage !== null) {
+        $covPairs = [
+            'P5' => ['lines_total', 'line denominator', 0],
+            'P4' => ['lines_covered', 'line covered', 0],
+            'P3' => ['lines_pct', 'line %', (float) $POLICY['line_tol']],
+            'P7' => ['branches_total', 'branch denominator', 0],
+            'P6' => ['branches_pct', 'branch %', (float) $POLICY['branch_tol']],
+        ];
+    }
+    foreach (['P3', 'P4', 'P5', 'P6', 'P7'] as $pk) {
+        if ($glCoverage === null || $ghm[$covPairs[$pk][0]] === null) {
+            $numNA[] = $pk;
+            continue;
+        }
+        $key = $covPairs[$pk][0];
+        $glv = $glCoverage[$key];
+        $ghv = $ghm[$key];
+        $tol = (float) $covPairs[$pk][2];
+        $bad = $tol > 0.0 ? (abs((float) $glv - (float) $ghv) > $tol) : ((string) $glv !== (string) $ghv);
+        if ($bad) {
+            $violations[] = "{$pk} {$short}: {$covPairs[$pk][1]} GitLab={$glv} <> GitHub={$ghv}" . ($tol > 0.0 ? " (tol {$tol})" : '');
+        }
+    }
+
+    // P11 — durasi job. INFORMASIONAL secara default (duration_tol = 0).
+    // CATATAN SEMANTIK (temuan gate run 2026-09-11): kedua sisi mengukur satuan yang BERBEDA —
+    // job `coverage-wait` GitLab mengukur waktu tunggu polling (~28 s) sedangkan run GitHub
+    // mengukur seluruh workflow PHPUnit+Xdebug (~700 s). Membandingkannya sebagai "pelanggaran"
+    // adalah positif-palsu. Karena itu enforcement P11 harus di-OPT-IN lewat `--duration-tol`.
+    if ($glm['duration_s'] !== null && $ghm['duration_s'] !== null) {
+        $delta = abs((int) $glm['duration_s'] - (int) $ghm['duration_s']);
+        $row['duration_delta_s'] = $delta;
+        if ($POLICY['duration_tol'] > 0 && $delta > $POLICY['duration_tol']) {
+            $violations[] = "P11 {$short}: duration GitLab={$glm['duration_s']}s <> GitHub={$ghm['duration_s']}s (tol {$POLICY['duration_tol']}s)";
+        }
+    } else {
+        $numNA[] = 'P11';
+    }
+
+    if ($numNA !== []) {
+        foreach ($numNA as $nk) {
+            $numericNA[$nk] = ($numericNA[$nk] ?? 0) + 1;
+        }
+        if ($strictNumeric) {
+            $operationalErrors++;
+            $violations[] = 'STRICT-numeric ' . $short . ': dimensi belum terukur [' . implode(',', $numNA) . ']';
+        }
+    }
+
+    // --- Hasil baris (fail-closed: baris tanpa verdict TIDAK boleh dianggap lulus).
     $row['result'] = 'PASS';
     if ($row['decision_parity'] === 'MISMATCH' || $row['instr_gate'] === 'MISMATCH') {
         $row['result'] = 'VIOLATION';
     } elseif ($conclusion === '' || $glState === '') {
-        $row['result'] = 'INCOMPLETE';
+        // P8 tidak dapat dinilai. BEDAKAN dua sebab (fail-closed tetap berlaku):
+        //   (a) pipeline commit ini TIDAK PERNAH mencapai tahap mirror-push
+        //       (coverage-offload != success) ⇒ paritas VAKUM — bukan lulus,
+        //       dilaporkan eksplisit sebagai N/A dan tidak menghitung error;
+        //   (b) mirror sudah ter-push tetapi run/status GitHub tidak ada ⇒
+        //       PELANGGARAN INVARIANT ⇒ KESALAHAN OPERASIONAL (exit 2).
+        $offload = glOffloadStatus($glApi, $glq, $branch, $glToken, $glSha);
+        if ($offload !== 'success') {
+            $row['result'] = 'N/A(no-dual-run:' . $offload . ')';
+            $vacuous++;
+        } else {
+            $row['result'] = 'INCOMPLETE';
+            $operationalErrors++;
+        }
+    } elseif ($numNA !== []) {
+        // Numerik belum lengkap pada tahap ini ⇒ ditandai eksplisit (bukan PASS diam-diam).
+        $row['result'] = 'PASS(n/a:' . implode(',', array_unique($numNA)) . ')';
     }
 
     $rows[] = $row;
@@ -404,10 +851,13 @@ foreach ($commits as $c) {
 // ---------------------------------------------------------------------------
 // Keluaran
 // ---------------------------------------------------------------------------
+// Verdict fail-closed: kesalahan operasional SELALU memaksa ERROR (exit 2), apa pun isinya.
 $verdict = $violations === [] ? 'PASS' : 'VIOLATION';
 if ($rows === []) {
-    $verdict = 'ERROR';
     $operationalErrors++;
+}
+if ($operationalErrors > 0) {
+    $verdict = 'ERROR';
 }
 
 if (!$compact) {
@@ -434,6 +884,9 @@ if (!$compact) {
             echo "    - {$v}\n";
         }
     }
+    if ($vacuous > 0) {
+        echo "  Catatan: {$vacuous} commit TANPA dual-run (coverage-offload != success) → N/A, bukan lulus.\n";
+    }
     echo "\n";
 }
 
@@ -444,6 +897,8 @@ $summary = [
     'rows'          => count($rows),
     'violations'    => count($violations),
     'operational_errors' => $operationalErrors,
+    'vacuous_skips' => $vacuous,
+    'numeric_not_measured' => $numericNA,
     'policy'        => $POLICY,
     'verdict'       => $verdict,
     'details'       => $violations,
@@ -512,6 +967,43 @@ function selftest(): int
     $ok('map success', mapConclusionToState('success') === 'success');
     $ok('map failure->failed', mapConclusionToState('failure') === 'failed');
     $ok('map timed_out->failed', mapConclusionToState('timed_out') === 'failed');
+
+    // P12 — pemetaan failure-mode (kode keluar / state) harus lengkap & konsisten.
+    $ok('P12 map cancelled->canceled', mapConclusionToState('cancelled') === 'canceled');
+    $ok('P12 map startup_failure->failed', mapConclusionToState('startup_failure') === 'failed');
+    $ok('P12 map unknown->unknown', mapConclusionToState('quux') === 'quux');
+    $ok('P12 success != failure', mapConclusionToState('success') !== mapConclusionToState('failure'));
+    $ok('P12 exit codes distinct', EXIT_PASS === 0 && EXIT_VIOLATION === 1 && EXIT_ERROR === 2);
+    $ok('P12 verdict fail-closed on operational error', (static function (): bool {
+        $operationalErrors = 1;
+        $violations = [];
+        $verdict = $violations === [] ? 'PASS' : 'VIOLATION';
+        if ($operationalErrors > 0) {
+            $verdict = 'ERROR';
+        }
+        return $verdict === 'ERROR';
+    })());
+
+    // Regresi G0-2: unduhan log job GitHub harus melewati redirect S3 TANPA header kredensial
+    // (php stream wrapper meneruskan Authorization -> 403 AuthenticationFailed). Header API
+    // tetap JSON + Authorization; log memakai kredensial sama namun dibuang saat lintas-host.
+    $ah = ghApiHeaders('t');
+    $ok('ghApiHeaders bawa Authorization', in_array('Authorization: token t', $ah, true));
+    $ok('ghApiHeaders JSON (bukan raw)', in_array('Accept: application/vnd.github+json', $ah, true) && !in_array('Accept: application/vnd.github.raw', $ah, true));
+
+    // Regresi G0-2: pembersih log (BOM + ANSI + CR) lalu parser tetap membaca angka.
+    $rawLog = "\xEF\xBB\xBF\x1B[36;1mRuntime: PHP 8.4.25 with Xdebug 3.5.3\x1B[0m\r\n"
+        . "Tests: 934, Assertions: 2392, PHPUnit Notices: 96, Skipped: 9.\r\n"
+        . "Coverage: 86.99% lines (4187/4813) | threshold 80.00% | 89.75% branches (4424/4929) | threshold 70.00%\r\n";
+    $cl = cleanLog($rawLog);
+    $ok('cleanLog buang BOM', strpos($cl, "\xEF\xBB\xBF") === false);
+    $ok('cleanLog buang ANSI', strpos($cl, "\x1B") === false);
+    $ok('cleanLog buang CR', strpos($cl, "\r") === false);
+    $lc = extractNumbers($cl);
+    $ok('parse dari log GH: tests/skipped', $lc['tests'] === 934 && $lc['skipped'] === 9);
+    $ok('parse dari log GH: php/xdebug', $lc['php'] === '8.4.25' && $lc['xdebug'] === '3.5.3');
+    $lg = parseGateText($cl);
+    $ok('parse dari log GH: coverage', $lg['lines_pct'] === 86.99 && $lg['lines_total'] === 4813 && $lg['branches_total'] === 4929);
 
     // Komparator keras: penyebut line berbeda -> pelanggaran.
     $denyDiff = ($g2['lines_total'] !== $g['lines_total']);
