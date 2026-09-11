@@ -11,7 +11,7 @@
 # Kode keluar: 0 = stabil/terkunci · 1 = drift (pelanggaran) · 2 = kesalahan operasional.
 #
 # Pemakaian:
-#   GL_TOKEN=… GH_TOKEN=… tools/migration/verify-baseline.sh \
+#   ZEF_GITLAB_TOKEN=… GH_TOKEN=… tools/migration/verify-baseline.sh \
 #     --gl-project=86155206 --repo=mbetixz/zef-coverage-runner --runs=3
 #
 set -euo pipefail
@@ -38,12 +38,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-GL_TOKEN="${GL_TOKEN:-${GITLAB_TOKEN:-}}"
+ZEF_GITLAB_TOKEN="${ZEF_GITLAB_TOKEN:-${GITLAB_TOKEN:-}}"
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 [ -n "$GL_PROJECT" ] || { echo "--gl-project wajib" >&2; exit 2; }
 [ -n "$REPO" ]       || { echo "--repo wajib" >&2; exit 2; }
-[ -n "$GL_TOKEN" ]   || { echo "GL_TOKEN/GITLAB_TOKEN tidak tersedia" >&2; exit 2; }
+[ -n "$ZEF_GITLAB_TOKEN" ]   || { echo "ZEF_GITLAB_TOKEN/GITLAB_TOKEN tidak tersedia" >&2; exit 2; }
 [ -n "$GH_TOKEN" ]   || { echo "GH_TOKEN/GITHUB_TOKEN tidak tersedia" >&2; exit 2; }
 
 mkdir -p "$OUT_DIR"
@@ -53,7 +53,7 @@ operational=0
 
 echo "== verify-baseline: ${RUNS} run per sisi (branch ${BRANCH}) =="
 
-GL_ANCHOR=$(curl -sS -H "PRIVATE-TOKEN: $GL_TOKEN" "$GL_API/projects/$GL_PROJECT/repository/branches/$BRANCH" \
+GL_ANCHOR=$(curl -sS -H "PRIVATE-TOKEN: $ZEF_GITLAB_TOKEN" "$GL_API/projects/$GL_PROJECT/repository/branches/$BRANCH" \
   | sed -n 's/.*"id":"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)
 echo "  GitLab anchor SHA: ${GL_ANCHOR:-<tidak terbaca>}"
 
@@ -68,7 +68,7 @@ if [ "$gh_count" = "0" ]; then
 fi
 
 # --- Sisi GitLab: pipeline terakhir pada branch kanonik ---
-gl_pipes="$(curl -sS -H "PRIVATE-TOKEN: $GL_TOKEN" \
+gl_pipes="$(curl -sS -H "PRIVATE-TOKEN: $ZEF_GITLAB_TOKEN" \
   "$GL_API/projects/$GL_PROJECT/pipelines?ref=$BRANCH&per_page=$RUNS")"
 
 echo "  -- ringkasan --"

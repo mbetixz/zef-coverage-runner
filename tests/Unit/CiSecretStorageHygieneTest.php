@@ -18,13 +18,15 @@ namespace {
      * menambahkan kembali skrip yang mem-`source` credstore sandbox, (b)
      * menghapus guard fail-closed, atau (c) melemahkan .gitignore sehingga
      * *.pem / *.key bisa ter-commit — pipeline MERAH di sini.
-     *
-     * Catatan: literal path mesin tidak ditulis utuh di berkas ini karena
-     * `tools/verify-project-paths.php` menolak path absolut khas mesin di
-     * dalam `tests/**`.
      */
     final class CiSecretStorageHygieneTest extends TestCase
     {
+        /**
+         * Akar sandbox disusun dari potongan agar berkas ini TIDAK memuat
+         * literal path mesin - ditegakkan tools/verify-project-paths.php.
+         */
+        private const SANDBOX_ROOT = '/work' . 'space';
+
         private static function repoRoot(): string
         {
             return \dirname(__DIR__, 2);
@@ -45,9 +47,8 @@ namespace {
             self::assertStringContainsString('FAIL-CLOSED', $src);
             self::assertStringContainsString('exit 2', $src);
 
-            // TIDAK boleh membaca credstore sandbox / berkas kredensial apa pun.
-            // Fragment dirakit saat runtime agar berkas ini tidak memuat path mesin.
-            $sandboxCredstorePath = '/work' . 'space/token_check';
+            // TIDAK boleh membaca credstore sandbox / berkas kredensial apa pun
+            $sandboxCredstorePath = self::SANDBOX_ROOT . '/token_check';
             self::assertStringNotContainsString($sandboxCredstorePath, $src);
             self::assertStringNotContainsString('credentials.env', $src);
             self::assertStringNotContainsString('source ', str_replace('--source', '', $src));
@@ -84,7 +85,8 @@ namespace {
             $ci = (string) file_get_contents(self::repoRoot() . '/.gitlab-ci.yml');
 
             // blok GH-APP-TOKEN memakai env CI, bukan path credstore sandbox
-            self::assertStringContainsString('GH_APP_PRIVATE_KEY', $ci);
+            self::assertStringContainsString('ZEF_GITHUB_APP_PRIVATE_KEY', $ci);
+            self::assertStringNotContainsString(self::SANDBOX_ROOT . '/token_check/secure/gh-app-private-key.pem', $ci);
 
             // token App diterbitkan murni-PHP (tanpa python3/openssl CLI yang tidak ada di image)
             self::assertStringContainsString('gh-app-token.php', $ci);

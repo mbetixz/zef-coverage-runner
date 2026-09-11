@@ -28,7 +28,7 @@
  * Pemakaian:
  *   php tools/migration/parity_check.php \
  *     --gl-project=86155206 --repo=mbetixz/zef-coverage-runner \
- *     --gl-token="$GL_TOKEN" --gh-token="$GH_TOKEN"
+ *     --gl-token="$ZEF_GITLAB_TOKEN" --gh-token="$GH_TOKEN"
  *
  * Flag:
  *   --gl-api=URL        (default https://gitlab.com/api/v4)
@@ -48,7 +48,7 @@
  *   --compact           ringkas (tanpa detail per-commit)
  *   --selftest          jalankan uji internal parser/komparator tanpa jaringan
  *
- * Token dibaca dari flag atau env (GL_TOKEN / GITHUB_TOKEN / GH_TOKEN). Token TIDAK pernah dicetak.
+ * Token dibaca dari flag atau env (ZEF_GITLAB_TOKEN / GITHUB_TOKEN / GH_TOKEN). Token TIDAK pernah dicetak.
  */
 
 declare(strict_types=1);
@@ -116,7 +116,7 @@ $POLICY['tests_tol']   = (int) $opt('tests-tol', $POLICY['tests_tol']);
 $POLICY['sample_days'] = (int) $opt('sample-days', $POLICY['sample_days']);
 $POLICY['duration_tol'] = (float) $opt('duration-tol', $POLICY['duration_tol']);
 
-$glToken = (string) ($opt('gl-token') ?: getenv('GL_TOKEN') ?: getenv('GITLAB_TOKEN') ?: '');
+$glToken = (string) ($opt('gl-token') ?: getenv('ZEF_GITLAB_TOKEN') ?: getenv('GITLAB_TOKEN') ?: '');
 $ghToken = (string) ($opt('gh-token') ?: getenv('GITHUB_TOKEN') ?: getenv('GH_TOKEN') ?: '');
 
 if ($glProject === '' || $repo === '') {
