@@ -57,6 +57,15 @@ const EXIT_PASS = 0;
 const EXIT_VIOLATION = 1;
 const EXIT_ERROR = 2;
 
+/**
+ * Sentinel: Xdebug DIKONFIRMASI TIDAK dimuat (bukan "tak terdeteksi"). Dipancarkan oleh
+ * workflow GitHub / job phpunit GitLab sebagai `XDEBUG_VERSION=__XDEBUG_ABSENT__` setelah
+ * probe `extension_loaded("xdebug")`. Bila nilainya sentinel ini, P9 menjadi PELANGGARAN
+ * KERAS (#27) — gate tidak boleh lulus di atas instrumentasi yang hilang. Seluruh ledger
+ * menuliskan literal ini seragam supaya mudah di-grep saat audit.
+ */
+const XDEBUG_ABSENT = '__XDEBUG_ABSENT__';
+
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
     'line_tol'     => 0.0,
@@ -404,7 +413,14 @@ function extractNumbers(string $txt): array
     if ($u['php'] === null && preg_match('/\bPHP\s+(\d+\.\d+\.\d+)/', $txt, $m)) {
         $u['php'] = $m[1];
     }
-    if ($u['xdebug'] === null && preg_match('/Xdebug\s+v?([0-9][0-9A-Za-z.\-]*)/', $txt, $m)) {
+    // (#27) Penanda EKSPLISIT diutamakan: `XDEBUG_VERSION=<versi>` atau sentinel
+    // `XDEBUG_VERSION=__XDEBUG_ABSENT__` yang dipancarkan workflow GitHub dan job phpunit
+    // GitLab. Jauh lebih andal daripada bersandar pada banner "Runtime: PHP ... with Xdebug
+    // ..." yang tidak selalu dicetak, DAN membedakan "Xdebug tak dimuat" (absen eksplisit)
+    // dari "tak terdeteksi" (tanpa penanda) — pembedaan yang menentukan P9 fail-closed.
+    if (preg_match('/XDEBUG_VERSION=([0-9][0-9A-Za-z.\-]*|__XDEBUG_ABSENT__)/', $txt, $m)) {
+        $u['xdebug'] = ($m[1] === XDEBUG_ABSENT) ? '' : $m[1];
+    } elseif ($u['xdebug'] === null && preg_match('/Xdebug\s+v?(\d+(?:\.\d+)*[0-9A-Za-z.\-]*)/', $txt, $m)) {
         $u['xdebug'] = $m[1];
     }
     return ['tests' => $u['tests'], 'skipped' => $u['skipped'], 'php' => $u['php'], 'xdebug' => $u['xdebug']];
@@ -435,6 +451,8 @@ function extractNumbers(string $txt): array
  *                            memverifikasi status menargetkan run yang sama dengan $runId)
  * @return array<string,mixed> metrik beserta `coverage_source` penanda asal-angka; dimensi
  *                            yang benar-benar tak terukur bernilai null (bukan 0 / bukan lulus)
+ *                            `xdebug_source` mencatat provenance versi Xdebug (#27):
+ *                            `gh_marker` | `gh_job_log` | `gh_marker_absent` | `gl_mirror` | `none`
  */
 function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToken, string $glStatusDesc = '', string $glStatusUrl = ''): array
 {
@@ -442,7 +460,7 @@ function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToke
         'tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null,
         'lines_pct' => null, 'lines_covered' => null, 'lines_total' => null,
         'branches_pct' => null, 'branches_covered' => null, 'branches_total' => null,
-        'duration_s' => null, 'coverage_source' => 'none',
+        'duration_s' => null, 'coverage_source' => 'none', 'xdebug_source' => 'none',
     ];
     // Koreksi review Qodo #2: JANGAN early-return saat run/job/log tak tersedia. Justru
     // log yang kedaluwarsa adalah skenario yang memotivasi fallback ini, sehingga seluruh
@@ -466,7 +484,18 @@ function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToke
         $out['tests'] = $n['tests'];
         $out['skipped'] = $n['skipped'];
         $out['php'] = $n['php'];
-        $out['xdebug'] = $n['xdebug'];
+        // (#27) P9: Xdebug diambil dari log job Actions. `extractNumbers()` mengembalikan ''
+        // bila penanda `XDEBUG_VERSION=__XDEBUG_ABSENT__` terbaca ⇒ Xdebug DIKONFIRMASI tidak
+        // dimuat. Itu bukan "tak terukur": dicatat sebagai sentinel supaya P9 menjadi
+        // pelanggaran keras. `null` (tanpa penanda) tetap "tak terukur" dan menunggu
+        // --strict-numeric. Provenance dicatat di `xdebug_source` agar asal-angka auditabel.
+        if ($n['xdebug'] === '') {
+            $out['xdebug'] = XDEBUG_ABSENT;
+            $out['xdebug_source'] = 'gh_marker_absent';
+        } elseif ($n['xdebug'] !== null) {
+            $out['xdebug'] = $n['xdebug'];
+            $out['xdebug_source'] = 'gh_job_log';
+        }
         $g = parseGateText($txt);
         foreach (['lines_pct', 'lines_covered', 'lines_total', 'branches_pct', 'branches_covered', 'branches_total'] as $k) {
             $out[$k] = $g[$k];
@@ -937,7 +966,7 @@ foreach ($commits as $idx => $c) {
         'gl_status_pages' => '', 'gl_status_correlated' => '', 'gl_status_fetch' => '',
         'lines_pct' => '', 'lines_covered' => '', 'lines_total' => '',
         'branches_pct' => '', 'branches_covered' => '', 'branches_total' => '',
-        'tests' => '', 'skipped' => '', 'php' => '', 'xdebug' => '',
+        'tests' => '', 'skipped' => '', 'php' => '', 'xdebug' => '', 'xdebug_source' => '',
         'instr_gate' => 'n/a', 'instr_phpunit' => 'n/a',
         'decision_parity' => 'n/a', 'result' => 'n/a',
         'coverage_source' => '',
@@ -1068,7 +1097,20 @@ foreach ($commits as $idx => $c) {
     $row['tests']   = $glm['tests'] ?? '';
     $row['skipped'] = $glm['skipped'] ?? '';
     $row['php']     = $glm['php'] ?? '';
-    $row['xdebug']  = $glm['xdebug'] ?? '';
+    // P9 (#27): Xdebug diambil dari SISI YANG MENGINSTRUMENTASI coverage. Sejak Fase 5 hanya
+    // GitHub yang menjalankan Xdebug (mode=coverage); job `phpunit` GitLab sengaja cepat TANPA
+    // Xdebug. Membaca `$glm` saja membuat kolom ini SELALU kosong ⇒ P9 tak pernah terukur.
+    // Otoritas versi = GitHub; GitLab tetap dibandingkan BILA ia memang menyediakannya.
+    $row['xdebug'] = XDEBUG_ABSENT;
+    $row['xdebug_source'] = 'none';
+    $ghXdebug = $ghm['xdebug'] ?? null;
+    if ($ghXdebug !== null && $ghXdebug !== '') {
+        $row['xdebug'] = ($ghXdebug === XDEBUG_ABSENT) ? XDEBUG_ABSENT : (string) $ghXdebug;
+        $row['xdebug_source'] = (string) ($ghm['xdebug_source'] ?? 'gh');
+    } elseif (($glm['xdebug'] ?? null) !== null && $glm['xdebug'] !== '') {
+        $row['xdebug'] = (string) $glm['xdebug'];
+        $row['xdebug_source'] = 'gl_mirror';
+    }
 
     $numNA = [];
 
@@ -1090,16 +1132,39 @@ foreach ($commits as $idx => $c) {
         $numNA[] = 'P2';
     }
 
-    // P9 — versi runtime PHP/Xdebug identik (Xdebug dibandingkan hanya bila kedua sisi menyediakannya).
-    if ($glm['php'] !== null && $ghm['php'] !== null) {
-        if ((string) $glm['php'] !== (string) $ghm['php']) {
-            $violations[] = "P9 {$short}: PHP GitLab={$glm['php']} <> GitHub={$ghm['php']}";
-        }
-        if ($glm['xdebug'] !== null && $ghm['xdebug'] !== null && (string) $glm['xdebug'] !== (string) $ghm['xdebug']) {
-            $violations[] = "P9 {$short}: Xdebug GitLab={$glm['xdebug']} <> GitHub={$ghm['xdebug']}";
-        }
-    } else {
-        $numNA[] = 'P9';
+    // P9 — paritas versi runtime PHP + Xdebug. (#27) Kini HARD assertion penuh.
+    //
+    // Perbandingan LINTAS-SISI hanya sah bila KEDUA sisi benar-benar menginstrumentasi
+    // runtime yang sama. Sejak Fase 5 job `coverage`/`:debug` GitLab dihapus: job `phpunit`
+    // GitLab memakai image stage `base` TANPA Xdebug (jalur cepat), sedangkan coverage
+    // dieksekusi PENUH oleh GitHub dengan Xdebug TER-PIN. Jadi:
+    //   • sisi GitLab absen-eksplisit  ⇒ paritas LINTAS-SISI diratifikasi GitLab-side-only
+    //     (bukan diam-diam lulus): yang ditegakkan adalah assert pin GitHub, yang memang
+    //     sudah fail-closed di workflow (setup-php pin `xdebug-$XDEBUG_PIN`).
+    //   • sisi GitHub absen-eksplisit   ⇒ PELANGGARAN KERAS (instrumentasi hilang; exit 2).
+    //   • kedua sisi memberi versi      ⇒ HARUS identik, tanpa toleransi.
+    // Tidak ada nilai yang dikarang: versi diambil apa adanya dari penanda stdout.
+    if ($glm['php'] !== null && $ghm['php'] !== null && (string) $glm['php'] !== (string) $ghm['php']) {
+        $violations[] = "P9 {$short}: PHP GitLab={$glm['php']} <> GitHub={$ghm['php']}";
+    }
+    $glXdebug  = $glm['xdebug'] ?? null;
+    $ghXdebug  = $ghm['xdebug'] ?? null;
+    // '' = sentinel absen-eksplisit dari `extractNumbers()` (dipakai sisi GitLab yang tidak
+    // melalui normalisasi ghRunMetrics()); null = tanpa penanda sama sekali.
+    $ghMissing = ($ghXdebug === null || $ghXdebug === '' || $ghXdebug === XDEBUG_ABSENT);
+    $glMissing = ($glXdebug === null || $glXdebug === '' || $glXdebug === XDEBUG_ABSENT);
+    if ($ghXdebug === XDEBUG_ABSENT) {
+        // Instrumen HILANG = DATA TIDAK LENGKAP, bukan sekadar pelanggaran kebijakan: naikkan
+        // juga penghitung operasional sehingga verdict ERROR + exit 2 (kontrak fail-closed
+        // yang diminta untuk P9, #27) — bukan sekadar MERAH sebagai VIOLATION.
+        $operationalErrors++;
+        $violations[] = "P9 {$short}: Xdebug GitHub DIKONFIRMASI TIDAK DIMUAT (instrumentasi hilang - gate tidak boleh lulus di atas instrumentasi yang absen)";
+    }
+    if (!$ghMissing && !$glMissing && (string) $glXdebug !== (string) $ghXdebug) {
+        $violations[] = "P9 {$short}: Xdebug GitLab={$glXdebug} <> GitHub={$ghXdebug}";
+    }
+    if ($glMissing && ($ghXdebug === null)) {
+        $numNA[] = 'P9';   // tak ada penanda di sisi mana pun ⇒ belum terukur
     }
 
     // P3/P4/P5/P6/P7 — coverage line & branch (persen, pembilang, penyebut) GitLab <-> GitHub.
@@ -1358,6 +1423,24 @@ function selftest(): int
     $lc = extractNumbers($cl);
     $ok('parse dari log GH: tests/skipped', $lc['tests'] === 934 && $lc['skipped'] === 9);
     $ok('parse dari log GH: php/xdebug', $lc['php'] === '8.4.25' && $lc['xdebug'] === '3.5.3');
+
+    // Regresi #27 (P9 hard assertion): penanda XDEBUG_VERSION diutamakan atas banner, supaya
+    // versi terbaca walau banner "with Xdebug" tak dicetak.
+    $mk = extractNumbers("XDEBUG_VERSION=3.5.3\nTests: 934, Assertions: 2392, Skipped: 9.\n");
+    $ok('#27 penanda XDEBUG_VERSION= didahulukan', $mk['xdebug'] === '3.5.3');
+    // Sentinel absen-eksplisit ⇒ '' (bukan null): pembeda "tak dimuat" vs "tak terukur".
+    $ab = extractNumbers("XDEBUG_VERSION=__XDEBUG_ABSENT__\nTests: 934, Assertions: 2392, Skipped: 9.\n");
+    $ok('#27 sentinel XDEBUG_VERSION=__XDEBUG_ABSENT__ -> string kosong', $ab['xdebug'] === '');
+    // Tanpa penanda apa pun ⇒ null ("tak terukur", bukan absen).
+    $nm = extractNumbers("Tests: 934, Assertions: 2392, Skipped: 9.\n");
+    $ok('#27 tanpa penanda -> null (tak terukur)', $nm['xdebug'] === null);
+    // Banner tetap jadi cadangan bila penanda tidak ada.
+    $ok('#27 banner Xdebug jadi cadangan', extractNumbers('Runtime: PHP 8.4.25 with Xdebug 3.5.3')['xdebug'] === '3.5.3');
+    $ok('#27 Xdebug tanpa nomor versi tidak diparse', extractNumbers('Xdebug failed to load, see log')['xdebug'] === null);
+    $ok('#27 sentinel konstan terdefinisi', XDEBUG_ABSENT === '__XDEBUG_ABSENT__' && XDEBUG_ABSENT !== '');
+    [$p9Result, $p9OpErr] = classifyRowResult('OK', 'OK', 'success', 'success', 'complete', 'success', ['P9']);
+    $ok('#27 dimensi P9 n/a tetap eksplisit (bukan PASS polos)', $p9Result === 'PASS(n/a:P9)' && $p9OpErr === false);
+    $ok('#27 kode keluar fail-closed tersedia', EXIT_ERROR === 2 && EXIT_VIOLATION === 1);
     $lg = parseGateText($cl);
     $ok('parse dari log GH: coverage', $lg['lines_pct'] === 86.99 && $lg['lines_total'] === 4813 && $lg['branches_total'] === 4929);
 
