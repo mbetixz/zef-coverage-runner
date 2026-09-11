@@ -412,43 +412,352 @@ function extractNumbers(string $txt): array
 
 /**
  * Metrik sisi GitHub: ambil job pertama pada run, durasi, lalu log job (plain).
- * @return array<string,mixed>
+ *
+ * Sumber angka coverage P3-P7 (#27) — DUA sumber terverifikasi, berurutan:
+ *  1. `gh_job_log`   : log job Actions memuat `Coverage: ... | ... branches ...`
+ *                      (tools/coverage-gate.php mencetak ke stdout, di-tee ke gate.txt).
+ *  2. `gl_commit_status` : deskripsi status commit GitLab `github-actions/coverage`,
+ *                      yang DIBUAT oleh workflow GitHub ini sendiri dengan isi
+ *                      "Coverage GitHub PASS: $(head -1 gate.txt)" — jadi tetap
+ *                      merupakan angka gate GitHub, verbatim, walau artifact/log
+ *                      sudah kedaluwarsa (retensi artifact GHA = 90 hari).
+ *
+ * `coverage_source` direkam ke ledger supaya asal-angka dapat diaudit, dan supaya
+ * dimensi yang benar-benar tak terukur tetap dilaporkan `n/a` — TIDAK dipalsukan lulus.
+ *
+ * @param string $ghApi        basis URL GitHub API (mis. https://api.github.com)
+ * @param string $repo         slug repo GitHub pemilik workflow, format `owner/repo`
+ * @param string $runId        ID run GitHub Actions yang metriknya diambil; '' = tak terukur
+ * @param string $ghToken      token GitHub (scope repo) untuk membaca API & log job
+ * @param string $glStatusDesc deskripsi status commit GitLab `github-actions/coverage`
+ *                            (opsional; fallback bila log job tak tersedia/kedaluwarsa)
+ * @param string $glStatusUrl  target_url status commit GitLab (opsional; dipakai untuk
+ *                            memverifikasi status menargetkan run yang sama dengan $runId)
+ * @return array<string,mixed> metrik beserta `coverage_source` penanda asal-angka; dimensi
+ *                            yang benar-benar tak terukur bernilai null (bukan 0 / bukan lulus)
  */
-function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToken): array
+function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToken, string $glStatusDesc = '', string $glStatusUrl = ''): array
 {
     $out = [
         'tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null,
         'lines_pct' => null, 'lines_covered' => null, 'lines_total' => null,
         'branches_pct' => null, 'branches_covered' => null, 'branches_total' => null,
-        'duration_s' => null,
+        'duration_s' => null, 'coverage_source' => 'none',
     ];
-    if ($runId === '') {
+    // Koreksi review Qodo #2: JANGAN early-return saat run/job/log tak tersedia. Justru
+    // log yang kedaluwarsa adalah skenario yang memotivasi fallback ini, sehingga seluruh
+    // langkah di bawah dibuat OPSIONAL dan fallback selalu dievaluasi.
+    $txt = '';
+    if ($runId !== '') {
+        $jobs = jsonGet("{$ghApi}/repos/{$repo}/actions/runs/" . rawurlencode($runId) . '/jobs?per_page=20', ghHeaders($ghToken), 30);
+        if (is_array($jobs) && (($jobs['jobs'] ?? []) !== [])) {
+            $job = $jobs['jobs'][0];
+            if (!empty($job['started_at']) && !empty($job['completed_at'])) {
+                $out['duration_s'] = max(0, (int) strtotime((string) $job['completed_at']) - (int) strtotime((string) $job['started_at']));
+            }
+            $jobId = (string) ($job['id'] ?? '');
+            if ($jobId !== '') {
+                $txt = ghJobLog($ghApi, $repo, $jobId, $ghToken);
+            }
+        }
+    }
+    if ($txt !== '') {
+        $n = extractNumbers($txt);
+        $out['tests'] = $n['tests'];
+        $out['skipped'] = $n['skipped'];
+        $out['php'] = $n['php'];
+        $out['xdebug'] = $n['xdebug'];
+        $g = parseGateText($txt);
+        foreach (['lines_pct', 'lines_covered', 'lines_total', 'branches_pct', 'branches_covered', 'branches_total'] as $k) {
+            $out[$k] = $g[$k];
+        }
+        if ($g['lines_total'] !== null || $g['branches_total'] !== null) {
+            $out['coverage_source'] = 'gh_job_log';
+        }
+    }
+    // Fallback (#27) — dijalankan SETELAH blok log, bukan dilompati oleh early-return.
+    // Koreksi review Qodo #6: verifikasi identitas status↔run. Status commit dan run GitHub
+    // dipilih independen; tanpa perbandingan, status dari rerun LAMA bisa menimpa coverage
+    // run BARU. target_url status memuat run ID (…/actions/runs/<id>) — cocokkan dengan $runId.
+    return applyCoverageFallback($out, $glStatusDesc, $glStatusUrl, $runId);
+}
+
+/**
+ * Pilih status commit `github-actions/coverage` yang MENARGETKAN run GitHub terpilih.
+ *
+ * Regresi review Qodo #7: seleksi lama berhenti pada entri PERTAMA yang namanya cocok,
+ * independen dari run yang sedang diukur. Pada commit dengan lebih dari satu rerun, entri
+ * pertama bisa menunjuk run LAMA sehingga fallback yang sah untuk run terpilih ikut ditolak
+ * oleh guard korelasi #6 — dimensi tetap null dan `--strict-numeric` memberi ERROR palsu.
+ *
+ * Prasyarat data (review Qodo #8): pemanggil HARUS meminta riwayat status lengkap
+ * (`all=true`); tanpa itu GitLab hanya menyemburkan status TERBARU sehingga fungsi ini
+ * tidak pernah melihat entri yang cocok.
+ *
+ * Kontrak: entri TERBARU yang korelasi run ID-nya TERBUKTI menang (penting bila commit
+ * yang sama punya beberapa status dari run yang sama, mis. rerun gagal lalu sukses); bila
+ * tidak ada yang terbukti, entri TERBARU yang cocok nama tetap dikembalikan agar guard
+ * korelasi di hilir yang memutuskan — fungsi ini tidak pernah mengarang korelasi.
+ * Mengasumsikan `$statuses` terurut terbaru-dulu (pemanggil memakai `sort=desc`).
+ *
+ * @param array<int,array<string,mixed>> $statuses daftar status commit GitLab (terbaru-dulu)
+ * @param string $runId ID run GitHub terpilih; '' = tanpa korelasi (entri terbaru dipakai)
+ * @return array<string,mixed>|null status terpilih, atau null bila tidak ada yang bernama cocok
+ */
+function selectCoverageStatus(array $statuses, string $runId): ?array
+{
+    $newest = null;
+    foreach ($statuses as $s) {
+        if (($s['name'] ?? '') !== 'github-actions/coverage') {
+            continue;
+        }
+        if ($newest === null) {
+            $newest = $s;
+        }
+        $url = (string) ($s['target_url'] ?? '');
+        if ($runId === '' || $url === '') {
+            continue;
+        }
+        if (preg_match('#/actions/runs/(\d+)#', $url, $m) === 1 && (string) $m[1] === $runId) {
+            return $s;   // terbaru yang terbukti cocok (input terurut terbaru-dulu)
+        }
+    }
+    return $newest;
+}
+
+/**
+ * Bangun URL permintaan status commit GitLab yang BENAR (dapat diuji terpisah).
+ *
+ * Koreksi review Qodo #9 (2026-09-11): URL dipindahkan ke fungsi ini agar `--selftest`
+ * memeriksa URL yang benar-benar DIBANGUN, bukan sekadar mencari fragmen di seluruh isi
+ * berkas — pencarian teks seluruh-berkas bisa dipuaskan oleh komentar (regresi review #10),
+ * sehingga penghapusan parameter produksi tetap lolos pemeriksaan.
+ *
+ * `all=true` wajib (tanpa itu hanya status TERBARU yang dikembalikan); `name` menyaring ke
+ * status coverage; `order_by=id&sort=desc` memberi urutan terbaru-dulu (diasumsikan oleh
+ * selectCoverageStatus()); `per_page=100` agar satu halaman seragam dengan penomoran halaman.
+ *
+ * @param string $glApi basis URL GitLab API (mis. https://gitlab.com/api/v4)
+ * @param string $glq   project ID/path ter-encode URL
+ * @param string $sha   SHA commit yang statusnya diminta
+ * @param int    $page  nomor halaman GitLab (1-based)
+ * @return string URL lengkap siap-request
+ */
+function coverageStatusUrl(string $glApi, string $glq, string $sha, int $page = 1): string
+{
+    return $glApi . '/projects/' . $glq . '/repository/commits/' . $sha . '/statuses'
+        . '?all=true&name=github-actions/coverage&order_by=id&sort=desc&per_page=100&page=' . max(1, $page);
+}
+
+/**
+ * Ambil status commit dengan MENELUSURI halaman sampai korelasi run ditemukan atau habis.
+ *
+ * Koreksi review Qodo #9: `all=true` TIDAK menghapus paginasi. Satu `jsonGet()` dibatasi
+ * `per_page` sehingga bila status run terpilih berada di halaman berikutnya, ia tak pernah
+ * terlihat dan `--strict-numeric` melaporkan "coverage hilang" padahal datanya ADA. Fungsi
+ * ini menelusuri halaman berurutan (terbaru-dulu) dan berhenti lebih awal begitu menemukan
+ * entri yang korelasi run ID-nya TERBUKTI cocok.
+ *
+ * @param string $glApi   basis URL GitLab API
+ * @param string $glq     project ID/path ter-encode
+ * @param string $sha     SHA commit
+ * @param array<string,string> $headers header GitLab (termasuk PRIVATE-TOKEN)
+ * @param string $runId   run GitHub terpilih; '' = tanpa korelasi (halaman pertama cukup)
+ * @param int    $maxPages batas halaman yang ditelusuri (pengaman)
+ * @return array{0: array<int,array<string,mixed>>, 1: bool, 2: int, 3: bool}
+ *         [statuses terkumpul (terbaru-dulu, aman dari duplikat), ditemukan-korelasi,
+ *          halaman-diperiksa, fetch-terpotong]
+ */
+function fetchCoverageStatuses(string $glApi, string $glq, string $sha, array $headers, string $runId, int $maxPages = 5): array
+{
+    $all = [];
+    $seen = [];
+    $pages = 0;
+    $found = false;
+    $failed = false;
+    for ($page = 1; $page <= max(1, $maxPages); $page++) {
+        $chunk = jsonGet(coverageStatusUrl($glApi, $glq, $sha, $page), $headers, 30);
+        $pages = $page;
+        if (!is_array($chunk)) {
+            // Koreksi review Qodo #11 (2026-09-11): `jsonGet()` menciutkan respons non-2xx,
+            // body kosong, dan JSON tak valid menjadi `null`. Dulu kondisi ini DIGABUNG dengan
+            // "halaman kosong", sehingga KEGAGALAN tampak identik dengan AKHIR riwayat
+            // (timeout halaman 2 = riwayat tamat) dan sepotong riwayat diaudit seolah lengkap.
+            // Kini keduanya dibedakan agar pemanggil dapat bersikap fail-closed.
+            $failed = true;
+            break;
+        }
+        if ($chunk === []) {
+            break;   // halaman kosong = akhir riwayat yang SAH
+        }
+        foreach ($chunk as $s) {
+            $key = (string) ($s['id'] ?? md5((string) ($s['name'] ?? '') . (string) ($s['target_url'] ?? '')));
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $all[] = $s;
+            $url = (string) ($s['target_url'] ?? '');
+            if (($s['name'] ?? '') === 'github-actions/coverage' && $runId !== '' && $url !== ''
+                && preg_match('#/actions/runs/(\d+)#', $url, $m) === 1 && (string) $m[1] === $runId) {
+                $found = true;
+            }
+        }
+        if (shouldStopStatusPaging($found, count($chunk), 100)) {
+            break;   // korelasi ditemukan, atau halaman terakhir (kurang dari per_page)
+        }
+    }
+    return [$all, $found, $pages, $failed];
+}
+
+/**
+ * Keputusan berhenti menelusuri halaman status commit (dipisah agar dapat diuji murni).
+ *
+ * Koreksi review Qodo #9: aturan henti dipisahkan menjadi fungsi tanpa efek samping sehingga
+ * `--selftest` dapat memverifikasi batas paginasi tanpa memanggil jaringan. Berhenti bila
+ * korelasi run sudah ditemukan, atau bila halaman yang diterima lebih pendek dari `perPage`
+ * (menandakan halaman terakhir). Halaman penuh tanpa korelasi → lanjut ke halaman berikutnya.
+ *
+ * @param bool $found      true bila entri ber-korelasi run sudah ditemukan
+ * @param int  $chunkCount jumlah entri pada halaman yang baru diterima
+ * @param int  $perPage    ukuran halaman yang diminta (default 100)
+ * @return bool true = berhenti menelusuri halaman
+ */
+function shouldStopStatusPaging(bool $found, int $chunkCount, int $perPage = 100): bool
+{
+    return $found || $chunkCount < $perPage;
+}
+
+/**
+ * Klasifikasi hasil satu baris ledger (fungsi MURNI — diuji langsung oleh --selftest).
+ *
+ * Koreksi review Qodo #12 (2026-09-11): percabangan inline sebelumnya menaruh pemeriksaan
+ * MISMATCH DI ATAS pemeriksaan riwayat-terpotong, sehingga mismatch yang berasal dari
+ * himpunan status TERPOTONG tidak pernah menaikkan $operationalErrors dan keluar sebagai
+ * VIOLATION alih-alih ERROR operasional yang dijanjikan oleh penanganan fail-closed.
+ *
+ * Urutan keputusan (fail-closed, tidak pernah menghasilkan "lulus" dari bukti tak lengkap):
+ *   1. VAKUM: pipeline tak mencapai mirror-push ⇒ N/A(no-dual-run:*) — bukan lulus, bukan error.
+ *   2. PARTIAL: riwayat status terpotong oleh kegagalan halaman ⇒ operasional error, MENDAHULUI
+ *      mismatch (bukti terpotong tidak boleh menghasilkan verdict paritas apa pun).
+ *   3. MISMATCH keputusan gate / instrumen ⇒ pelanggaran kebijakan (VIOLATION).
+ *   4. P8 tak dapat dinilai tetapi mirror ter-push ⇒ INVARIANT dilanggar ⇒ operasional error.
+ *   5. Dimensi numerik belum terukur ⇒ PASS(n/a:...) eksplisit (bukan PASS polos).
+ *   6. Selainnya ⇒ PASS.
+ *
+ * @param string $decisionParity nilai kolom decision_parity ('OK'|'MISMATCH'|'n/a')
+ * @param string $instrGate      nilai kolom instr_gate ('OK'|'MISMATCH'|'n/a')
+ * @param string $conclusion     conclusion run GitHub ('' bila run tak terpilih)
+ * @param string $glState        state status GitLab ('' bila status tak terpilih)
+ * @param string $glStatusFetch  'complete'|'partial' — kelengkapan riwayat status
+ * @param string $offloadState   hasil glOffloadStatus() ('' bila belum diperiksa)
+ * @param array<int,string> $numNA dimensi numerik yang belum terukur
+ * @return array{0:string,1:bool,2:bool} [result, isOperationalError, isVacuous]
+ */
+function classifyRowResult(
+    string $decisionParity,
+    string $instrGate,
+    string $conclusion,
+    string $glState,
+    string $glStatusFetch,
+    string $offloadState,
+    array $numNA
+): array {
+    // 1. Vakum: commit tanpa dual-run (pipeline tak mencapai offload).
+    if (($conclusion === '' || $glState === '') && $offloadState !== 'success') {
+        return ['N/A(no-dual-run:' . $offloadState . ')', false, true];
+    }
+    // 2. Riwayat status terpotong — MENDAHULUI mismatch (koreksi Qodo #12).
+    if ($glStatusFetch === 'partial') {
+        return ['INCOMPLETE(gl_status_partial)', true, false];
+    }
+    // 3. Pelanggaran kebijakan.
+    if ($decisionParity === 'MISMATCH' || $instrGate === 'MISMATCH') {
+        return ['VIOLATION', false, false];
+    }
+    // 4. P8 tak dapat dinilai padahal mirror ter-push ⇒ invariant dilanggar.
+    if ($conclusion === '' || $glState === '') {
+        return ['INCOMPLETE', true, false];
+    }
+    // 5. Dimensi numerik belum terukur ⇒ ditandai eksplisit.
+    if ($numNA !== []) {
+        return ['PASS(n/a:' . implode(',', array_unique($numNA)) . ')', false, false];
+    }
+    // 6. Lulus.
+    return ['PASS', false, false];
+}
+
+/**
+ * Fallback provenance coverage (#27): isi P3-P7 dari deskripsi status commit GitLab
+ * `github-actions/coverage`. Deskripsi itu DIBUAT oleh workflow GitHub ini sendiri (memuat
+ * baris gate.txt verbatim), jadi tetap merupakan angka gate GitHub walau log/artifact
+ * sudah kedaluwarsa. Bila keenam dimensinya lengkap DAN korelasi status<->run terbukti, ia
+ * menggantikan angka log secara atomik; bila korelasi GAGAL, angka log dipertahankan utuh.
+ *
+ * @param array<string,mixed> $out          hasil ghRunMetrics(); `coverage_source` = asal-angka
+ * @param string              $glStatusDesc deskripsi status commit GitLab ('' = tanpa fallback)
+ * @param string              $glStatusUrl  target_url status commit GitLab ('' = tanpa verifikasi)
+ * @param string              $runId        ID run GitHub yang sedang diukur ('' = tanpa verifikasi)
+ * @return array<string,mixed> hasil sama; terisi dari fallback hanya bila sumber masih 'none'
+ */
+function applyCoverageFallback(array $out, string $glStatusDesc, string $glStatusUrl = '', string $runId = ''): array
+{
+    if ($glStatusDesc === '') {
         return $out;
     }
-    $jobs = jsonGet("{$ghApi}/repos/{$repo}/actions/runs/" . rawurlencode($runId) . '/jobs?per_page=20', ghHeaders($ghToken), 30);
-    if (!is_array($jobs) || (($jobs['jobs'] ?? []) === [])) {
+    // Koreksi review Qodo #6: bila run GitHub terpilih, status commit HANYA boleh dipakai
+    // bila target_url-nya menunjuk run yang SAMA. Status dari rerun lama (run ID berbeda)
+    // tidak boleh menimpa coverage run yang sedang diukur — mencegah audit coverage basi.
+    if ($runId !== '' && $glStatusUrl !== '') {
+        $statusRunId = '';
+        if (preg_match('#/actions/runs/(\d+)#', $glStatusUrl, $m)) {
+            $statusRunId = $m[1];
+        }
+        if ($statusRunId !== '' && $statusRunId !== $runId) {
+            return $out;   // status menargetkan run LAIN → jangan dipakai
+        }
+    }
+    // Koreksi review Qodo #4 (2026-09-11): deskripsi status TIDAK LAGI diabaikan hanya karena
+    // "sudah ada sumber terpilih". Akar cacat lama: `ghRunMetrics()` menandai `gh_job_log` bila
+    // SALAH SATU penyebut (lines ATAU branches) ter-parse, lalu guard "sumber != none" membuat
+    // fallback tak pernah jalan — sehingga log PARSIAL (hanya lines) meninggalkan dimensi branch
+    // null ⇒ `--strict-numeric` mengubahnya menjadi ERROR walau deskripsi status LENGKAP tersedia.
+    //
+    // Kontrak baru: `$glStatusDesc` dibuat oleh workflow GitHub ini sendiri (baris gate.txt
+    // verbatim, commit-scoped) ⇒ ia OTORITAS TERTINGGI. Bila keenam dimensinya lengkap, ia
+    // menggantikan sumber sebelumnya secara atomik (nilai DAN provenance).
+    $gs = parseGateText($glStatusDesc);
+    $keys = ['lines_pct', 'lines_covered', 'lines_total', 'branches_pct', 'branches_covered', 'branches_total'];
+    $complete = true;
+    foreach ($keys as $k) {
+        if ($gs[$k] === null) {
+            $complete = false;
+        }
+    }
+    if ($complete) {
+        foreach ($keys as $k) {
+            $out[$k] = $gs[$k];
+        }
+        $out['coverage_source'] = 'gl_commit_status';
         return $out;
     }
-    $job = $jobs['jobs'][0];
-    if (!empty($job['started_at']) && !empty($job['completed_at'])) {
-        $out['duration_s'] = max(0, (int) strtotime((string) $job['completed_at']) - (int) strtotime((string) $job['started_at']));
+    // Deskripsi status TIDAK lengkap → hanya menambal dimensi yang masih kosong. Nilai yang
+    // sudah terpilih TIDAK diturunkan/ditimpa, dan provenance mencatat campuran nyata agar
+    // audit asal-angka tidak menyesatkan.
+    $patched = false;
+    foreach ($keys as $k) {
+        if ($out[$k] === null && $gs[$k] !== null) {
+            $out[$k] = $gs[$k];
+            $patched = true;
+        }
     }
-    $jobId = (string) ($job['id'] ?? '');
-    if ($jobId === '') {
-        return $out;
-    }
-    $txt = ghJobLog($ghApi, $repo, $jobId, $ghToken);
-    if ($txt === '') {
-        return $out;
-    }
-    $n = extractNumbers($txt);
-    $out['tests'] = $n['tests'];
-    $out['skipped'] = $n['skipped'];
-    $out['php'] = $n['php'];
-    $out['xdebug'] = $n['xdebug'];
-    $g = parseGateText($txt);
-    foreach (['lines_pct', 'lines_covered', 'lines_total', 'branches_pct', 'branches_covered', 'branches_total'] as $k) {
-        $out[$k] = $g[$k];
+    if ($patched) {
+        $cur = (string) ($out['coverage_source'] ?? 'none');
+        if ($cur === 'none') {
+            $out['coverage_source'] = 'gl_commit_status';
+        } elseif ($cur !== 'gl_commit_status') {
+            $out['coverage_source'] = $cur . '+gl_commit_status';
+        }
     }
     return $out;
 }
@@ -624,28 +933,19 @@ foreach ($commits as $idx => $c) {
         'gl_sha' => $glSha, 'gl_created_at' => $createdAt,
         'mirror_sha' => $mirrorSha,
         'gh_run_id' => '', 'gh_conclusion' => '', 'gh_url' => '',
-        'gl_state' => '', 'gl_desc' => '',
+        'gl_state' => '', 'gl_desc' => '', 'gl_target_url' => '',
+        'gl_status_pages' => '', 'gl_status_correlated' => '', 'gl_status_fetch' => '',
         'lines_pct' => '', 'lines_covered' => '', 'lines_total' => '',
         'branches_pct' => '', 'branches_covered' => '', 'branches_total' => '',
         'tests' => '', 'skipped' => '', 'php' => '', 'xdebug' => '',
         'instr_gate' => 'n/a', 'instr_phpunit' => 'n/a',
         'decision_parity' => 'n/a', 'result' => 'n/a',
+        'coverage_source' => '',
     ];
 
-    // --- Sisi GitLab: external status check
-    $statuses = jsonGet("{$glApi}/projects/{$glq}/repository/commits/{$glSha}/statuses?per_page=100", glHeaders($glToken), 30) ?? [];
-    $glState = '';
-    foreach ($statuses as $s) {
-        if (($s['name'] ?? '') === 'github-actions/coverage') {
-            $glState = (string) ($s['status'] ?? '');
-            $row['gl_desc'] = (string) ($s['description'] ?? '');
-            $row['gh_url'] = (string) ($s['target_url'] ?? '');
-            break;
-        }
-    }
-    $row['gl_state'] = $glState;
-
-    // --- Sisi GitHub: run terakhir utk mirror sha
+    // --- Sisi GitHub DULU: run terpilih (regresi review Qodo #7).
+    // Urutan ini penting: status commit harus dipilih BERDASARKAN run yang sedang diukur,
+    // bukan sekadar entri pertama yang namanya cocok.
     $conclusion = '';
     if ($mirrorSha !== '') {
         $runs = jsonGet("{$ghApi}/repos/{$repo}/actions/runs?head_sha={$mirrorSha}&per_page=10", ghHeaders($ghToken), 30) ?? [];
@@ -653,25 +953,55 @@ foreach ($commits as $idx => $c) {
             if (($r['status'] ?? '') === 'completed') {
                 $conclusion = (string) ($r['conclusion'] ?? '');
                 $row['gh_run_id'] = (string) ($r['id'] ?? '');
-                if ($row['gh_url'] === '') {
-                    $row['gh_url'] = (string) ($r['html_url'] ?? '');
-                }
+                $row['gh_url'] = (string) ($r['html_url'] ?? '');
                 break;
             }
         }
     }
     $row['gh_conclusion'] = $conclusion;
 
-    // Angka coverage: dari deskripsi status GitLab (memuat output gate GitHub verbatim).
-    if ($row['gl_desc'] !== '') {
-        $g = parseGateText($row['gl_desc']);
-        $row['lines_pct'] = $g['lines_pct'] ?? '';
-        $row['lines_covered'] = $g['lines_covered'] ?? '';
-        $row['lines_total'] = $g['lines_total'] ?? '';
-        $row['branches_pct'] = $g['branches_pct'] ?? '';
-        $row['branches_covered'] = $g['branches_covered'] ?? '';
-        $row['branches_total'] = $g['branches_total'] ?? '';
+    // --- Sisi GitLab: external status check, DIKORELASIKAN ke run terpilih
+    // Koreksi review Qodo #7: dulu loop berhenti di entri PERTAMA yang namanya cocok,
+    // independen dari run. Pada commit dengan beberapa rerun, entri pertama bisa menunjuk
+    // run LAMA sementara run BARU yang diukur — guard korelasi #6 lalu menolak fallback
+    // yang SEBENARNYA tersedia untuk run itu, sehingga dimensi tetap null dan
+    // `--strict-numeric` melaporkan ERROR palsu.
+    // Koreksi review Qodo #8 (2026-09-11): `all=true` WAJIB. Tanpa itu GitLab hanya
+    // mengembalikan status TERBARU per name, sehingga mode strict dapat melaporkan
+    // "coverage hilang" padahal sumbernya ada — cukup dengan status dari rerun lain
+    // yang selesai TERAKHIR. `order_by=id&sort=desc` memberi urutan terbaru-dulu agar
+    // entri terbaru tetap menjadi jatuhan terakhir (semantik lama terjaga).
+    // Koreksi review Qodo #9 (2026-09-11): `all=true` TIDAK menghapus paginasi — bila
+    // status run terpilih ada di halaman berikutnya, ia tak pernah terlihat. URL dibangun
+    // oleh coverageStatusUrl() (dapat diuji) dan penelusuran halaman dilakukan hingga
+    // korelasi run ditemukan atau riwayat habis.
+    [$statuses, $corrFound, $pagesScanned, $fetchPartial] = fetchCoverageStatuses($glApi, $glq, (string) $glSha, glHeaders($glToken), (string) $row['gh_run_id'], 5);
+    // Catatan audit: bila penelusuran harus melewati >1 halaman, riwayat status commit ini
+    // panjang. Korelasi run dicari lebih dulu oleh fetchCoverageStatuses(); nilai $corrFound
+    // dan $pagesScanned dicatat agar perilaku paginasi dapat diaudit (dipakai di bawah).
+    $row['gl_status_pages'] = (string) $pagesScanned;
+    $row['gl_status_correlated'] = $corrFound ? 'yes' : 'no';
+    // Koreksi review Qodo #11: catat apakah pengambilan riwayat TERPOTONG oleh kegagalan
+    // halaman (bukan akhir riwayat). Kolom audit ini memungkinkan baris tidak-lengkap
+    // dikenali dari luar tanpa membaca kode.
+    $row['gl_status_fetch'] = $fetchPartial ? 'partial' : 'complete';
+    $glState = '';
+    $picked = selectCoverageStatus($statuses, (string) $row['gh_run_id']);
+    if ($picked !== null) {
+        $glState = (string) ($picked['status'] ?? '');
+        $row['gl_desc'] = (string) ($picked['description'] ?? '');
+        $row['gl_target_url'] = (string) ($picked['target_url'] ?? '');
+        if ($row['gh_url'] === '') {
+            $row['gh_url'] = (string) ($picked['target_url'] ?? '');
+        }
     }
+    $row['gl_state'] = $glState;
+
+    // Koreksi review Qodo #3: kolom coverage SENGAJA tidak diisi di sini. ghRunMetrics()
+    // memilih SUMBER (provenance) dan nilainya sekaligus, lalu ledger menulis keduanya
+    // secara ATOMIK di bawah. Mengisi lebih awal dari `gl_desc` membuat label provenance
+    // bisa menyimpang dari angka yang benar-benar tertulis. Fallback `gl_desc` ditangani
+    // DI DALAM ghRunMetrics() (applyCoverageFallback).
 
     // --- P8: paritas keputusan gate
     if ($conclusion !== '' && $glState !== '') {
@@ -723,14 +1053,17 @@ foreach ($commits as $idx => $c) {
     //   diam-diam; naikkan ke ERROR lewat --strict-numeric (disarankan aktif pada Tahap 3c).
     // -----------------------------------------------------------------------
     $glm = glRunMetrics($glApi, $glq, $branch, $glToken, 'phpunit', $glSha);
-    $ghm = [
-        'tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null,
-        'lines_pct' => null, 'lines_covered' => null, 'lines_total' => null,
-        'branches_pct' => null, 'branches_covered' => null, 'branches_total' => null,
-        'duration_s' => null,
-    ];
-    if ($row['gh_run_id'] !== '') {
-        $ghm = ghRunMetrics($ghApi, $repo, $row['gh_run_id'], $ghToken);
+    // Koreksi review Qodo #2: satu jalur tunggal. ghRunMetrics() menangani runId kosong
+    // DAN fallback `gl_desc` secara internal, sehingga tidak ada lagi duplikasi logika
+    // fallback di pemanggil yang bisa terlewat.
+    $ghm = ghRunMetrics($ghApi, $repo, (string) $row['gh_run_id'], $ghToken, (string) $row['gl_desc'], (string) $row['gl_target_url']);
+
+    // Koreksi review Qodo #3: nilai coverage ditulis ATOMIK dengan provenance-nya. Satu
+    // sumber terpilih (gh_job_log | gl_commit_status) mengisi SELURUH kolom, sehingga label
+    // provenance tidak pernah menyimpang dari angka yang tercatat di ledger.
+    $row['coverage_source'] = $ghm['coverage_source'] ?? '';
+    foreach (['lines_pct', 'lines_covered', 'lines_total', 'branches_pct', 'branches_covered', 'branches_total'] as $ck) {
+        $row[$ck] = $ghm[$ck] !== null ? $ghm[$ck] : '';
     }
     $row['tests']   = $glm['tests'] ?? '';
     $row['skipped'] = $glm['skipped'] ?? '';
@@ -771,6 +1104,16 @@ foreach ($commits as $idx => $c) {
 
     // P3/P4/P5/P6/P7 — coverage line & branch (persen, pembilang, penyebut) GitLab <-> GitHub.
     $glCoverage = glCoverageMetrics($glApi, $glq, $branch, $glToken, $glSha);
+    if ($glCoverage === null && (string) $row['gl_desc'] !== '') {
+        // Fallback sisi GitLab (#27): status commit `github-actions/coverage` memuat gate.txt verbatim.
+        // CATATAN ARSITEKTUR: sejak Fase 5 job `coverage` GitLab dihapus, jadi coverage
+        // dieksekusi HANYA oleh GitHub; "sisi GitLab" di sini adalah cermin status kanonik
+        // GitLab atas angka gate GitHub — bukan pengukuran independen. Dicatat di ADR/ratifikasi.
+        $gc = parseGateText((string) $row['gl_desc']);
+        if ($gc['lines_total'] !== null || $gc['branches_total'] !== null) {
+            $glCoverage = $gc;
+        }
+    }
     $covPairs = [];
     if ($glCoverage !== null) {
         $covPairs = [
@@ -822,27 +1165,31 @@ foreach ($commits as $idx => $c) {
     }
 
     // --- Hasil baris (fail-closed: baris tanpa verdict TIDAK boleh dianggap lulus).
-    $row['result'] = 'PASS';
-    if ($row['decision_parity'] === 'MISMATCH' || $row['instr_gate'] === 'MISMATCH') {
-        $row['result'] = 'VIOLATION';
-    } elseif ($conclusion === '' || $glState === '') {
-        // P8 tidak dapat dinilai. BEDAKAN dua sebab (fail-closed tetap berlaku):
-        //   (a) pipeline commit ini TIDAK PERNAH mencapai tahap mirror-push
-        //       (coverage-offload != success) ⇒ paritas VAKUM — bukan lulus,
-        //       dilaporkan eksplisit sebagai N/A dan tidak menghitung error;
-        //   (b) mirror sudah ter-push tetapi run/status GitHub tidak ada ⇒
-        //       PELANGGARAN INVARIANT ⇒ KESALAHAN OPERASIONAL (exit 2).
-        $offload = glOffloadStatus($glApi, $glq, $branch, $glToken, $glSha);
-        if ($offload !== 'success') {
-            $row['result'] = 'N/A(no-dual-run:' . $offload . ')';
-            $vacuous++;
-        } else {
-            $row['result'] = 'INCOMPLETE';
-            $operationalErrors++;
-        }
-    } elseif ($numNA !== []) {
-        // Numerik belum lengkap pada tahap ini ⇒ ditandai eksplisit (bukan PASS diam-diam).
-        $row['result'] = 'PASS(n/a:' . implode(',', array_unique($numNA)) . ')';
+    // Koreksi review Qodo #12 (2026-09-11): klasifikasi dipusatkan ke fungsi MURNI
+    // classifyRowResult() yang mengembalikan [result, isOperationalError, isVacuous].
+    // Sebelumnya percabangan inline menaruh cabang MISMATCH DI ATAS cabang partial, sehingga
+    // mismatch yang berasal dari himpunan status TERPOTONG melewati $operationalErrors++ dan
+    // keluar sebagai VIOLATION alih-alih ERROR operasional. Urutan baru: vakum (N/A) →
+    // partial (operasional, MENDAHULUI mismatch) → mismatch (VIOLATION) → numerik-n/a → PASS.
+    $offloadState = '';
+    if ($conclusion === '' || $glState === '') {
+        $offloadState = glOffloadStatus($glApi, $glq, $branch, $glToken, $glSha);
+    }
+    [$rowResult, $rowIsOpErr, $rowIsVacuous] = classifyRowResult(
+        (string) $row['decision_parity'],
+        (string) $row['instr_gate'],
+        $conclusion,
+        $glState,
+        (string) ($row['gl_status_fetch'] ?? 'complete'),
+        $offloadState,
+        $numNA
+    );
+    $row['result'] = $rowResult;
+    if ($rowIsVacuous) {
+        $vacuous++;
+    }
+    if ($rowIsOpErr) {
+        $operationalErrors++;
     }
 
     $rows[] = $row;
@@ -932,9 +1279,18 @@ if ($operationalErrors > 0) {
 }
 exit($violations === [] ? EXIT_PASS : EXIT_VIOLATION);
 
-// ---------------------------------------------------------------------------
-// Selftest — membuktikan parser & komparator bekerja (tanpa jaringan)
-// ---------------------------------------------------------------------------
+/**
+ * Selftest internal (tanpa jaringan) — membuktikan parser, komparator, dan fallback provenance
+ * coverage bekerja sebagaimana diklaim, sehingga regresi pada gate paritas dapat ditangkap
+ * sebelum menyentuh CI.
+ *
+ * Cakupan assertion: ekstraksi angka dari log GitHub Actions, parse baris gate, deteksi penyebut
+ * yang berbeda antar-sisi, fallback `gl_commit_status` saat log kosong/kedaluwarsa, penolakan saat
+ * tanpa deskripsi status, serta supremasi deskripsi status LENGKAP atas log PARSIAL
+ * (regresi review Qodo #4).
+ *
+ * @return int EXIT_PASS (0) bila seluruh assertion lulus; EXIT_VIOLATION bila ada yang gagal
+ */
 function selftest(): int
 {
     $fail = 0;
@@ -1010,6 +1366,159 @@ function selftest(): int
     $ok('deteksi penyebut line berbeda', $denyDiff === false);
     $branchDiff = ($g2['branches_total'] !== $g['branches_total']);
     $ok('deteksi penyebut branch berbeda', $branchDiff === true);
+
+    // Regresi review Qodo #2: log job KOSONG/kedaluwarsa + deskripsi status valid HARUS
+    // tetap mengisi P3-P7 lewat fallback `gl_commit_status` (bukan null yang berujung ERROR).
+    $emptyOut = [
+        'tests' => null, 'skipped' => null, 'php' => null, 'xdebug' => null,
+        'lines_pct' => null, 'lines_covered' => null, 'lines_total' => null,
+        'branches_pct' => null, 'branches_covered' => null, 'branches_total' => null,
+        'duration_s' => null, 'coverage_source' => 'none',
+    ];
+    $fb = applyCoverageFallback($emptyOut, 'Coverage GitHub PASS: Coverage: 86.99% lines (4187/4813) | threshold 80.00% | 89.75% branches (4424/4929) | threshold 70.00%');
+    $ok('Qodo#2 fallback isi coverage saat log kosong', $fb['lines_pct'] === 86.99 && $fb['lines_total'] === 4813 && $fb['branches_total'] === 4929);
+    $ok('Qodo#2 fallback set provenance gl_commit_status', $fb['coverage_source'] === 'gl_commit_status');
+    $ok('Qodo#2 tanpa deskripsi tetap none', applyCoverageFallback($emptyOut, '')['coverage_source'] === 'none');
+    // Regresi review Qodo #4: log PARSIAL (hanya lines, tanpa branches) dulu mengunci sumber
+    // `gh_job_log` dan menyisakan dimensi branch null → ERROR palsu pada `--strict-numeric`.
+    // Deskripsi status LENGKAP (otoritas tertinggi) harus menang & mengisi keenam dimensi atomik.
+    $partial = $emptyOut;
+    $partial['coverage_source'] = 'gh_job_log';
+    $partial['lines_pct'] = 86.99;
+    $partial['lines_covered'] = 4187;
+    $partial['lines_total'] = 4813;
+    $sup = applyCoverageFallback($partial, 'Coverage GitHub PASS: Coverage: 86.99% lines (4187/4813) | threshold 80.00% | 89.75% branches (4424/4929) | threshold 70.00%');
+    $ok('Qodo#4 deskripsi lengkap mengisi branches dari log parsial', $sup['branches_pct'] === 89.75 && $sup['branches_covered'] === 4424 && $sup['branches_total'] === 4929);
+    $ok('Qodo#4 provenance atomik gl_commit_status', $sup['coverage_source'] === 'gl_commit_status' && $sup['lines_pct'] === 86.99);
+    // Deskripsi PARSIAL tidak boleh menimpa nilai terpilih; hanya menambal yang masih kosong.
+    $logOut = $emptyOut;
+    $logOut['coverage_source'] = 'gh_job_log';
+    $logOut['lines_pct'] = 86.99;
+    $kept = applyCoverageFallback($logOut, 'Coverage GitHub PASS: Coverage: 84.21% lines (4053/4813) | threshold 80.00%');
+    $ok('Qodo#4 deskripsi parsial menambal tanpa menurunkan nilai terpilih', $kept['lines_pct'] === 86.99 && $kept['coverage_source'] === 'gh_job_log+gl_commit_status');
+
+    // Regresi review Qodo #6: KORELASI status<->run. Status dan run dipilih INDEPENDEN; tanpa
+    // perbandingan identitas, status dari rerun LAMA bisa menimpa coverage rerun BARU sehingga
+    // ledger mencampur coverage basi dengan tests/durasi run baru.
+    $urlA = 'https://github.com/mbetixz/zef-coverage-runner/actions/runs/34538707594';
+    $urlB = 'https://github.com/mbetixz/zef-coverage-runner/actions/runs/11111111111';
+    $descFull = 'Coverage GitHub PASS: Coverage: 86.99% lines (4187/4813) | threshold 80.00% | 89.75% branches (4424/4929) | threshold 70.00%';
+    // (a) run ID cocok -> status otoritatif, seluruh dimensi terisi.
+    $matchOut = applyCoverageFallback($emptyOut, $descFull, $urlA, '34538707594');
+    $ok('Qodo#6 run id cocok -> status otoritatif', $matchOut['coverage_source'] === 'gl_commit_status' && $matchOut['branches_total'] === 4929);
+    // (b) run ID BERBEDA -> status rerun lama TIDAK boleh menimpa coverage run terpilih.
+    $stale = $emptyOut;
+    $stale['coverage_source'] = 'gh_job_log';
+    $stale['tests'] = 934;
+    $stale['lines_pct'] = 86.99;
+    $stale['lines_covered'] = 4187;
+    $stale['lines_total'] = 4813;
+    $staleOut = applyCoverageFallback($stale, 'Coverage GitHub PASS: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', $urlB, '34538707594');
+    $ok('Qodo#6 status rerun lama tidak menimpa run terpilih', $staleOut['lines_pct'] === 86.99 && $staleOut['coverage_source'] === 'gh_job_log' && $staleOut['tests'] === 934);
+    // (c) tanpa run ID / tanpa URL -> verifikasi tak mungkin, status tetap dipakai (perilaku lama).
+    $ok('Qodo#6 tanpa run id korelasi dilewati', applyCoverageFallback($emptyOut, $descFull, $urlA, '')['coverage_source'] === 'gl_commit_status');
+
+    // Regresi review Qodo #7: seleksi status harus MENGIKUTI run terpilih, bukan entri pertama.
+    // Skenario nyata: entri pertama menunjuk run LAMA, run terpilih punya status sendiri.
+    $stOld = ['name' => 'github-actions/coverage', 'status' => 'success', 'description' => 'Coverage GitHub PASS: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', 'target_url' => $urlB];
+    $stNew = ['name' => 'github-actions/coverage', 'status' => 'success', 'description' => $descFull, 'target_url' => $urlA];
+    $picked = selectCoverageStatus([$stOld, $stNew], '34538707594');
+    $ok('Qodo#7 status run terpilih menang atas entri pertama', is_array($picked) && $picked['target_url'] === $urlA);
+    // Tanpa run terpilih -> entri pertama (perilaku lama) dipertahankan.
+    $pickedFirst = selectCoverageStatus([$stOld, $stNew], '');
+    $ok('Qodo#7 tanpa run terpilih pakai entri pertama', is_array($pickedFirst) && $pickedFirst['target_url'] === $urlB);
+    // Tidak ada status yang cocok -> entri pertama dikembalikan, guard korelasi di hilir yang memutuskan.
+    $pickedNone = selectCoverageStatus([$stOld], '34538707594');
+    $ok('Qodo#7 tanpa status cocok jatuh ke entri pertama', is_array($pickedNone) && $pickedNone['target_url'] === $urlB);
+    // Tanpa status sama sekali -> null, bukan error.
+    $ok('Qodo#7 tanpa status mengembalikan null', selectCoverageStatus([], '34538707594') === null);
+
+    // Regresi review Qodo #8: `all=true` + order_by=id&sort=desc wajib ada agar riwayat status
+    // benar-benar tersedia; dan bila beberapa entri menunjuk run yang SAMA, entri TERBARU menang.
+    $ok('Qodo#8 permintaan status memakai all=true', str_contains(coverageStatusUrl('https://gl', 'p', 'abc'), 'all=true') && str_contains(coverageStatusUrl('https://gl', 'p', 'abc'), 'order_by=id&sort=desc'));
+    // Regresi review Qodo #10: assertion TIDAK boleh dipuaskan oleh komentar. Verifikasi
+    // langsung URL yang DIBANGUN helper (bukan pencarian teks seluruh berkas), termasuk
+    // parameter paginasi dan nomor halaman eksplisit.
+    $qUrl = coverageStatusUrl('https://gitlab.com/api/v4', 'zeflous%2Fzef', 'deadbeef', 3);
+    $qParsed = [];
+    parse_str((string) parse_url($qUrl, PHP_URL_QUERY), $qParsed);
+    $ok('Qodo#10 URL status punya all=true', ($qParsed['all'] ?? '') === 'true');
+    $ok('Qodo#10 URL status filter name coverage', ($qParsed['name'] ?? '') === 'github-actions/coverage');
+    $ok('Qodo#10 URL status urut terbaru-dulu', ($qParsed['order_by'] ?? '') === 'id' && ($qParsed['sort'] ?? '') === 'desc');
+    $ok('Qodo#10 URL status halaman eksplisit & per_page=100', ($qParsed['page'] ?? '') === '3' && ($qParsed['per_page'] ?? '') === '100');
+    $ok('Qodo#10 basis/segmen URL utuh', str_starts_with($qUrl, 'https://gitlab.com/api/v4/projects/zeflous%2Fzef/repository/commits/deadbeef/statuses?'));
+    // Regresi review Qodo #11: KEGAGALAN halaman harus dapat dibedakan dari AKHIR riwayat.
+    // `shouldStopStatusPaging()` memisahkan tiga sebab berhenti sehingga pemanggil dapat
+    // bersikap fail-closed alih-alih mengaudit riwayat terpotong seolah lengkap.
+    $ok('Qodo#11 stop: korelasi ditemukan', shouldStopStatusPaging(true, 100, 100) === true);
+    $ok('Qodo#11 stop: halaman terakhir (kurang dari per_page)', shouldStopStatusPaging(false, 42, 100) === true);
+    $ok('Qodo#11 stop: halaman penuh tanpa korelasi -> lanjut', shouldStopStatusPaging(false, 100, 100) === false);
+    // Kontrak pembeda: `jsonGet()` null (halaman GAGAL) tidak boleh disamakan dengan halaman
+    // kosong (akhir riwayat) — dinyatakan di sini sebagai dokumentasi yang dapat dieksekusi.
+    $ok('Qodo#11 null bukan array (halaman gagal) vs array kosong (riwayat habis)', !is_array(null) && is_array([]) && [] === []);
+    // Regresi review Qodo #9: `all=true` TIDAK menghapus paginasi. Aturan henti-paginasi diuji
+    // murni (tanpa jaringan) — halaman penuh tanpa korelasi LANJUT; halaman pendek atau korelasi
+    // ketemu BERHENTI. Ini yang mencegah status di halaman berikutnya terlewat.
+    $ok('Qodo#9 halaman penuh tanpa korelasi lanjut', shouldStopStatusPaging(false, 100, 100) === false);
+    $ok('Qodo#9 halaman pendek berhenti', shouldStopStatusPaging(false, 37, 100) === true);
+    $ok('Qodo#9 korelasi ketemu berhenti walau halaman penuh', shouldStopStatusPaging(true, 100, 100) === true);
+    $ok('Qodo#9 halaman kosong berhenti', shouldStopStatusPaging(false, 0, 100) === true);
+    // URL halaman berbeda harus benar-benar berbeda (penomoran halaman nyata, bukan konstan).
+    $ok('Qodo#9 nomor halaman berpengaruh pada URL', coverageStatusUrl('https://gl', 'p', 'a', 1) !== coverageStatusUrl('https://gl', 'p', 'a', 2));
+    $stSameOld = ['name' => 'github-actions/coverage', 'status' => 'failed', 'description' => 'Coverage GitHub FAIL: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', 'target_url' => $urlA];
+    $stSameNew = ['name' => 'github-actions/coverage', 'status' => 'success', 'description' => $descFull, 'target_url' => $urlA];
+    // input terurut terbaru-dulu (sort=desc), keduanya run yang sama -> entri terbaru menang.
+    $pickedSame = selectCoverageStatus([$stSameNew, $stSameOld], '34538707594');
+    $ok('Qodo#8 run sama -> entri terbaru menang', is_array($pickedSame) && $pickedSame['status'] === 'success');
+    // status rerun LAIN yang selesai terakhir (terbaru-dulu) tidak boleh menyembunyikan
+    // status sah run terpilih yang ada di posisi berikutnya.
+    $pickedHist = selectCoverageStatus([$stOld, $stNew], '34538707594');
+    $ok('Qodo#8 status terbaru run lain tidak menyembunyikan run terpilih', is_array($pickedHist) && $pickedHist['target_url'] === $urlA);
+
+    // Regresi review Qodo #6: status commit dari rerun LAMA (run ID berbeda) TIDAK boleh
+    // menimpa coverage run yang sedang diukur. target_url status memuat run ID; bila tidak
+    // cocok dengan runId, fallback harus ditolak (nilai tetap dari sumber terpilih).
+    $stale = $emptyOut;
+    $stale['coverage_source'] = 'gh_job_log';
+    $stale['lines_pct'] = 86.99;
+    $stale['lines_covered'] = 4187;
+    $stale['lines_total'] = 4813;
+    $stale['branches_pct'] = 89.75;
+    $stale['branches_covered'] = 4424;
+    $stale['branches_total'] = 4929;
+    $rej = applyCoverageFallback($stale, 'Coverage GitHub PASS: Coverage: 84.21% lines (4053/4813) | threshold 80.00% | 88.34% branches (4327/4898) | threshold 0.00%', 'https://github.com/mbetixz/zef-coverage-runner/actions/runs/99999999999', '34538707594');
+    $ok('Qodo#6 status rerun lama ditolak (run ID beda)', $rej['lines_pct'] === 86.99 && $rej['lines_total'] === 4813 && $rej['coverage_source'] === 'gh_job_log');
+    // Status yang menargetkan run SAMA tetap boleh dipakai (fallback sah).
+    $same = $emptyOut;
+    $same['coverage_source'] = 'gh_job_log';
+    $same['lines_pct'] = 86.99;
+    $same['lines_covered'] = 4187;
+    $same['lines_total'] = 4813;
+    $acc = applyCoverageFallback($same, 'Coverage GitHub PASS: Coverage: 86.99% lines (4187/4813) | threshold 80.00% | 89.75% branches (4424/4929) | threshold 70.00%', 'https://github.com/mbetixz/zef-coverage-runner/actions/runs/34538707594', '34538707594');
+    $ok('Qodo#6 status run sama tetap dipakai', $acc['branches_total'] === 4929 && $acc['coverage_source'] === 'gl_commit_status');
+
+    // Regresi review Qodo #12: URUTAN klasifikasi. Riwayat terpotong (partial) harus
+    // MENDAHULUI mismatch, agar mismatch dari himpunan status terpotong tetap menjadi
+    // operasional error (exit 2), bukan VIOLATION biasa.
+    [$rPartialMismatch, $opErr1, $vac1] = classifyRowResult('MISMATCH', 'OK', 'success', 'failed', 'partial', 'success', []);
+    $ok('Qodo#12 partial mendahului mismatch -> ERROR operasional', $rPartialMismatch === 'INCOMPLETE(gl_status_partial)' && $opErr1 === true && $vac1 === false);
+    [$rPartialOk, $opErr2] = classifyRowResult('OK', 'OK', 'success', 'success', 'partial', 'success', []);
+    $ok('Qodo#12 partial walau tanpa mismatch tetap ERROR', $rPartialOk === 'INCOMPLETE(gl_status_partial)' && $opErr2 === true);
+    // Riwayat lengkap + mismatch -> VIOLATION (bukan error operasional).
+    [$rMismatch, $opErr3] = classifyRowResult('MISMATCH', 'OK', 'success', 'failed', 'complete', 'success', []);
+    $ok('Qodo#12 lengkap + mismatch -> VIOLATION', $rMismatch === 'VIOLATION' && $opErr3 === false);
+    // Vakum tetap vakum, tidak berubah menjadi error.
+    [$rVac, , $vac4] = classifyRowResult('n/a', 'n/a', '', '', 'complete', 'skipped', []);
+    $ok('Qodo#12 vakum -> N/A(no-dual-run) tanpa error', str_starts_with($rVac, 'N/A(no-dual-run:') && $vac4 === true);
+    // Mirror ter-push tapi status/run tak ada -> INCOMPLETE (invariant) operasional.
+    [$rInc, $opErr5] = classifyRowResult('n/a', 'n/a', '', '', 'complete', 'success', []);
+    $ok('Qodo#12 mirror ter-push tanpa run -> INCOMPLETE operasional', $rInc === 'INCOMPLETE' && $opErr5 === true);
+    // Numerik belum terukur -> PASS(n/a:...) eksplisit, bukan PASS polos.
+    [$rNumNA] = classifyRowResult('OK', 'OK', 'success', 'success', 'complete', 'success', ['P3', 'P4']);
+    $ok('Qodo#12 numerik n/a ditandai eksplisit', $rNumNA === 'PASS(n/a:P3,P4)');
+    // Lulus bersih.
+    [$rPass] = classifyRowResult('OK', 'OK', 'success', 'success', 'complete', 'success', []);
+    $ok('Qodo#12 lulus bersih -> PASS', $rPass === 'PASS');
 
     echo $fail === 0 ? "== selftest: LULUS ==\n" : "== selftest: {$fail} GAGAL ==\n";
     return $fail === 0 ? EXIT_PASS : EXIT_VIOLATION;
