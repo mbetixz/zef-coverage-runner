@@ -150,6 +150,14 @@ jobs:
       - name: Composer install (lock 1:1)
         run: composer install --prefer-dist --no-progress --no-interaction --no-scripts --optimize-autoloader
 
+      # P9 (#27): pancarkan versi Xdebug EKSPLISIT sebagai penanda yang mudah di-parse.
+      # Gate paritas (tools/migration/parity_check.php) membacanya dari log job ini agar
+      # P9 tidak lagi "tak terukur". Sentinel __XDEBUG_ABSENT__ dipakai bila ekstensi
+      # TIDAK dimuat -> gate menjadi MERAH (instrumentasi hilang bukan lulus diam-diam).
+      - name: Emit Xdebug version marker (#27 / P9)
+        run: |
+          set -euo pipefail
+          php -r 'echo "XDEBUG_VERSION=" . (extension_loaded("xdebug") ? phpversion("xdebug") : "__XDEBUG_ABSENT__") . PHP_EOL;'
       - name: PHPUnit + Xdebug branch coverage
         run: |
           mkdir -p var/phpunit var/coverage
