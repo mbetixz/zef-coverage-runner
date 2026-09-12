@@ -54,6 +54,17 @@ on:
   # (sha256 sama), jadi sync bersifat idempoten.
   push:
     branches: ["ci/phpstan-offload-github", "main"]
+  # PR TRIGGER — ditambahkan agar context job ini layak dijadikan required
+  # status check pada ruleset `main-protection-app-bypass` (#22945106).
+  # ALASAN: required status check dievaluasi terhadap head SHA PR, jadi check
+  # WAJIB diproduksi pada event `pull_request`. Tanpa trigger ini, check hanya
+  # lahir setelah push ke `main` -> gate tidak pernah terpenuhi di PR ->
+  # merge deadlock, dan satu-satunya jalur merge kembali ke bypass GitHub App.
+  # Dibatasi ke PR yang menargetkan `main`; `ready_for_review` disertakan
+  # supaya PR draft tidak ikut dieksekusi.
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
   # Jalur manual untuk re-run / eksekusi lokal.
   workflow_dispatch:
 
