@@ -9,7 +9,7 @@
  *   2. Mengambil bukti dari KEDUA sisi:
  *        - GitHub : run terakhir (conclusion) + angka coverage (via deskripsi status GitLab,
  *                   yang memuat output gate GitHub verbatim; artifact opsional bila unzip ada).
- *        - GitLab : external status check `github-actions/coverage` (state/description/target_url).
+ *        - GitLab : external status check `zef/coverage-gate` (state/description/target_url).
  *   3. Menjalankan pemeriksaan paritas:
  *        P8  keputusan gate   : kesimpulan run GitHub  <->  state status GitLab
  *        P1  jumlah test      : hanya bila kedua sisi menyediakan (ditandai "n/a" bila tidak)
@@ -56,6 +56,19 @@ declare(strict_types=1);
 const EXIT_PASS = 0;
 const EXIT_VIOLATION = 1;
 const EXIT_ERROR = 2;
+
+/**
+ * NAMA KANONIK status commit GitLab untuk gate coverage (#33).
+ *
+ * Split-brain evidence: producer (`coverage-wait`, jalur push) mempublikasikan status
+ * `zef/coverage-gate`, dan OBSERVER (`coverage-gate-audit`, jalur schedule) membacanya
+ * sebagai status kanonik. Checker paritas ini dulu masih mencari nama WARISAN
+ * `github-actions/coverage` yang SUDAH TIDAK PERNAH dipublikasikan lagi, sehingga setiap
+ * baris selalu `gl_state=''` ("missing") walau gate di HEAD sebenarnya PASS - gate hijau
+ * sementara auditor buta. Konstanta ini menjadikan satu nama sebagai satu-satunya sumber,
+ * dipakai oleh seleksi status, pembangunan URL, dan deteksi korelasi run.
+ */
+const COVERAGE_STATUS_NAME = 'zef/coverage-gate';
 
 /**
  * Sentinel: Xdebug DIKONFIRMASI TIDAK dimuat (bukan "tak terdeteksi"). Dipancarkan oleh
@@ -439,7 +452,7 @@ function extractNumbers(string $txt): array
  * Sumber angka coverage P3-P7 (#27) — DUA sumber terverifikasi, berurutan:
  *  1. `gh_job_log`   : log job Actions memuat `Coverage: ... | ... branches ...`
  *                      (tools/coverage-gate.php mencetak ke stdout, di-tee ke gate.txt).
- *  2. `gl_commit_status` : deskripsi status commit GitLab `github-actions/coverage`,
+ *  2. `gl_commit_status` : deskripsi status commit GitLab `zef/coverage-gate`,
  *                      yang DIBUAT oleh workflow GitHub ini sendiri dengan isi
  *                      "Coverage GitHub PASS: $(head -1 gate.txt)" — jadi tetap
  *                      merupakan angka gate GitHub, verbatim, walau artifact/log
@@ -452,7 +465,7 @@ function extractNumbers(string $txt): array
  * @param string $repo         slug repo GitHub pemilik workflow, format `owner/repo`
  * @param string $runId        ID run GitHub Actions yang metriknya diambil; '' = tak terukur
  * @param string $ghToken      token GitHub (scope repo) untuk membaca API & log job
- * @param string $glStatusDesc deskripsi status commit GitLab `github-actions/coverage`
+ * @param string $glStatusDesc deskripsi status commit GitLab `zef/coverage-gate`
  *                            (opsional; fallback bila log job tak tersedia/kedaluwarsa)
  * @param string $glStatusUrl  target_url status commit GitLab (opsional; dipakai untuk
  *                            memverifikasi status menargetkan run yang sama dengan $runId)
@@ -519,7 +532,7 @@ function ghRunMetrics(string $ghApi, string $repo, string $runId, string $ghToke
 }
 
 /**
- * Pilih status commit `github-actions/coverage` yang MENARGETKAN run GitHub terpilih.
+ * Pilih status commit `zef/coverage-gate` (nama kanonik, #33) yang MENARGETKAN run GitHub terpilih.
  *
  * Regresi review Qodo #7: seleksi lama berhenti pada entri PERTAMA yang namanya cocok,
  * independen dari run yang sedang diukur. Pada commit dengan lebih dari satu rerun, entri
@@ -544,7 +557,7 @@ function selectCoverageStatus(array $statuses, string $runId): ?array
 {
     $newest = null;
     foreach ($statuses as $s) {
-        if (($s['name'] ?? '') !== 'github-actions/coverage') {
+        if (($s['name'] ?? '') !== COVERAGE_STATUS_NAME) {
             continue;
         }
         if ($newest === null) {
@@ -582,7 +595,7 @@ function selectCoverageStatus(array $statuses, string $runId): ?array
 function coverageStatusUrl(string $glApi, string $glq, string $sha, int $page = 1): string
 {
     return $glApi . '/projects/' . $glq . '/repository/commits/' . $sha . '/statuses'
-        . '?all=true&name=github-actions/coverage&order_by=id&sort=desc&per_page=100&page=' . max(1, $page);
+        . '?all=true&name=' . COVERAGE_STATUS_NAME . '&order_by=id&sort=desc&per_page=100&page=' . max(1, $page);
 }
 
 /**
@@ -634,7 +647,7 @@ function fetchCoverageStatuses(string $glApi, string $glq, string $sha, array $h
             $seen[$key] = true;
             $all[] = $s;
             $url = (string) ($s['target_url'] ?? '');
-            if (($s['name'] ?? '') === 'github-actions/coverage' && $runId !== '' && $url !== ''
+            if (($s['name'] ?? '') === COVERAGE_STATUS_NAME && $runId !== '' && $url !== ''
                 && preg_match('#/actions/runs/(\d+)#', $url, $m) === 1 && (string) $m[1] === $runId) {
                 $found = true;
             }
@@ -721,7 +734,19 @@ function classifyRowResult(
         return ['VIOLATION', false, false];
     }
     // 4. P8 tak dapat dinilai padahal mirror ter-push ⇒ invariant dilanggar.
+    //
+    //    #33: di rezim evidence-contract-otoritatif, status kanonik hanya dipublikasikan
+    //    oleh commit yang pipeline-nya benar-benar mencapai `coverage-wait`. Commit historis
+    //    (pra-kontrak) tidak memilikinya — itu BUKAN kontradiksi dan BUKAN lulus diam-diam,
+    //    jadi dilaporkan eksplisit `n/a(canonical-status-absent)`. Penegakan gate di HEAD
+    //    tetap HARD di langkah [4/7] observer (status kanonik wajib `success`), sehingga
+    //    melunaknya verdict PARITAS tidak pernah melemahkan gerbang yang sesungguhnya.
+    //    Tanpa `--evidence-authoritative`, perilaku fail-closed lama (INCOMPLETE = ERROR)
+    //    dipertahankan utuh.
     if ($conclusion === '' || $glState === '') {
+        if ($evidenceAuthoritative && $conclusion !== '') {
+            return ['n/a(canonical-status-absent)', false, false];
+        }
         return ['INCOMPLETE', true, false];
     }
     // 5. Dimensi numerik belum terukur ⇒ ditandai eksplisit.
@@ -734,7 +759,7 @@ function classifyRowResult(
 
 /**
  * Fallback provenance coverage (#27): isi P3-P7 dari deskripsi status commit GitLab
- * `github-actions/coverage`. Deskripsi itu DIBUAT oleh workflow GitHub ini sendiri (memuat
+ * `zef/coverage-gate`. Deskripsi itu DIBUAT oleh workflow GitHub ini sendiri (memuat
  * baris gate.txt verbatim), jadi tetap merupakan angka gate GitHub walau log/artifact
  * sudah kedaluwarsa. Bila keenam dimensinya lengkap DAN korelasi status<->run terbukti, ia
  * menggantikan angka log secara atomik; bila korelasi GAGAL, angka log dipertahankan utuh.
@@ -1207,7 +1232,7 @@ foreach ($commits as $idx => $c) {
     // P3/P4/P5/P6/P7 — coverage line & branch (persen, pembilang, penyebut) GitLab <-> GitHub.
     $glCoverage = glCoverageMetrics($glApi, $glq, $branch, $glToken, $glSha);
     if ($glCoverage === null && (string) $row['gl_desc'] !== '') {
-        // Fallback sisi GitLab (#27): status commit `github-actions/coverage` memuat gate.txt verbatim.
+        // Fallback sisi GitLab (#27): status commit `zef/coverage-gate` memuat gate.txt verbatim.
         // CATATAN ARSITEKTUR: sejak Fase 5 job `coverage` GitLab dihapus, jadi coverage
         // dieksekusi HANYA oleh GitHub; "sisi GitLab" di sini adalah cermin status kanonik
         // GitLab atas angka gate GitHub — bukan pengukuran independen. Dicatat di ADR/ratifikasi.
@@ -1541,8 +1566,8 @@ function selftest(): int
 
     // Regresi review Qodo #7: seleksi status harus MENGIKUTI run terpilih, bukan entri pertama.
     // Skenario nyata: entri pertama menunjuk run LAMA, run terpilih punya status sendiri.
-    $stOld = ['name' => 'github-actions/coverage', 'status' => 'success', 'description' => 'Coverage GitHub PASS: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', 'target_url' => $urlB];
-    $stNew = ['name' => 'github-actions/coverage', 'status' => 'success', 'description' => $descFull, 'target_url' => $urlA];
+    $stOld = ['name' => COVERAGE_STATUS_NAME, 'status' => 'success', 'description' => 'Coverage GitHub PASS: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', 'target_url' => $urlB];
+    $stNew = ['name' => COVERAGE_STATUS_NAME, 'status' => 'success', 'description' => $descFull, 'target_url' => $urlA];
     $picked = selectCoverageStatus([$stOld, $stNew], '34538707594');
     $ok('Qodo#7 status run terpilih menang atas entri pertama', is_array($picked) && $picked['target_url'] === $urlA);
     // Tanpa run terpilih -> entri pertama (perilaku lama) dipertahankan.
@@ -1564,7 +1589,10 @@ function selftest(): int
     $qParsed = [];
     parse_str((string) parse_url($qUrl, PHP_URL_QUERY), $qParsed);
     $ok('Qodo#10 URL status punya all=true', ($qParsed['all'] ?? '') === 'true');
-    $ok('Qodo#10 URL status filter name coverage', ($qParsed['name'] ?? '') === 'github-actions/coverage');
+    $ok('Qodo#10 URL status filter name coverage', ($qParsed['name'] ?? '') === COVERAGE_STATUS_NAME);
+    // #33: pin nilai konstanta secara eksplisit (bukan hanya dipakai oleh dirinya sendiri),
+    // agar penamaan kanonik tidak dapat bergeser tanpa membuat assertion ini MERAH.
+    $ok('#33 nama status kanonik = zef/coverage-gate', COVERAGE_STATUS_NAME === 'zef/coverage-gate');
     $ok('Qodo#10 URL status urut terbaru-dulu', ($qParsed['order_by'] ?? '') === 'id' && ($qParsed['sort'] ?? '') === 'desc');
     $ok('Qodo#10 URL status halaman eksplisit & per_page=100', ($qParsed['page'] ?? '') === '3' && ($qParsed['per_page'] ?? '') === '100');
     $ok('Qodo#10 basis/segmen URL utuh', str_starts_with($qUrl, 'https://gitlab.com/api/v4/projects/zeflous%2Fzef/repository/commits/deadbeef/statuses?'));
@@ -1586,8 +1614,8 @@ function selftest(): int
     $ok('Qodo#9 halaman kosong berhenti', shouldStopStatusPaging(false, 0, 100) === true);
     // URL halaman berbeda harus benar-benar berbeda (penomoran halaman nyata, bukan konstan).
     $ok('Qodo#9 nomor halaman berpengaruh pada URL', coverageStatusUrl('https://gl', 'p', 'a', 1) !== coverageStatusUrl('https://gl', 'p', 'a', 2));
-    $stSameOld = ['name' => 'github-actions/coverage', 'status' => 'failed', 'description' => 'Coverage GitHub FAIL: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', 'target_url' => $urlA];
-    $stSameNew = ['name' => 'github-actions/coverage', 'status' => 'success', 'description' => $descFull, 'target_url' => $urlA];
+    $stSameOld = ['name' => COVERAGE_STATUS_NAME, 'status' => 'failed', 'description' => 'Coverage GitHub FAIL: Coverage: 11.11% lines (535/4813) | threshold 80.00% | 22.22% branches (1096/4929) | threshold 70.00%', 'target_url' => $urlA];
+    $stSameNew = ['name' => COVERAGE_STATUS_NAME, 'status' => 'success', 'description' => $descFull, 'target_url' => $urlA];
     // input terurut terbaru-dulu (sort=desc), keduanya run yang sama -> entri terbaru menang.
     $pickedSame = selectCoverageStatus([$stSameNew, $stSameOld], '34538707594');
     $ok('Qodo#8 run sama -> entri terbaru menang', is_array($pickedSame) && $pickedSame['status'] === 'success');
