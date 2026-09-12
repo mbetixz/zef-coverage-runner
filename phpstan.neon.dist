@@ -1,0 +1,31 @@
+includes:
+    - phpstan-baseline.neon
+
+parameters:
+    level: max
+    paths:
+        - src
+        - tests
+        - index.php
+        - quality-gate.php
+        - build/build-monolith.php
+        - tools/verify-composer-lock.php
+        - tools/generate-sbom.php
+        - tools/generate-provenance.php
+        - tools/generate-release-manifest.php
+        - tools/verify-supply-chain.php
+        - tools/verify-release-integrity.php
+        - tools/documentation-consistency.php
+        - tools/release-governance.php
+        - tools/verify-project-paths.php
+        - tools/verify-baseline-drift.php
+    tmpDir: var/phpstan
+    bootstrapFiles:
+        - src/autoload.php
+    reportUnmatchedIgnoredErrors: true
+    treatPhpDocTypesAsCertain: true
+    checkMissingOverrideMethodAttribute: true
+
+    excludePaths:
+        - src/kernel.php
+        - tests/_history/*
