@@ -2854,6 +2854,23 @@ function selftest(): int
     $ok('GateE actor_ids terekam pada jalur terukur',
         ($eAct['merge_control']['observability']['actor_ids'] ?? []) === ['4911046']);
 
+    // -----------------------------------------------------------------------
+    // Gate F hardening (#39) - GUARD REGRESI pada PEMBUNGKUS SHELL observer.
+    //   Fallback ke anchor historis ('evidence contract v2') mengganti anchor
+    //   yang hilang dengan anchor yang LEBIH TUA (pra-insiden), sehingga commit
+    //   sebelum perbaikan determinisme masuk keranjang kualifikasi -> QUALIFIED
+    //   palsu. PHP-nya sudah fail-closed, tetapi pembungkus shell bisa menutupi
+    //   itu; assertion ini menjaga agar celah tersebut tidak pernah kembali.
+    // -----------------------------------------------------------------------
+    $ciPath = dirname(__DIR__, 2) . '/.gitlab-ci.yml';
+    if (is_file($ciPath)) {
+        $ci = (string) file_get_contents($ciPath);
+        $ok('GateF-harden CI: fallback anchor historis SUDAH TIDAK ADA di observer',
+            stripos($ci, 'mundur ke anchor historis') === false);
+        $ok('GateF-harden CI: observer fail-closed tegas saat anchor tak terdefinisi',
+            strpos($ci, 'TIDAK ADA fallback (fail-closed)') !== false);
+    }
+
     echo $fail === 0 ? "== selftest: LULUS ==\n" : "== selftest: {$fail} GAGAL ==\n";
     return $fail === 0 ? EXIT_PASS : EXIT_VIOLATION;
 }
