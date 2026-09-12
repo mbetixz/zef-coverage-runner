@@ -79,6 +79,18 @@ const COVERAGE_STATUS_NAME = 'zef/coverage-gate';
  */
 const XDEBUG_ABSENT = '__XDEBUG_ABSENT__';
 
+/**
+ * Gate A (#34): schema context audit evidence-contract v2 yang dibangun observer
+ * (`coverage-gate-audit`) dan dikonsumsi mode `--audit-evidence`.
+ */
+const AUDIT_CONTEXT_SCHEMA = 'zef.coverage-gate.audit-context/v1';
+/** Gate A (#34): schema keluaran verdict empat domain. */
+const DOMAIN_VERDICT_SCHEMA = 'zef.coverage-gate.domain-verdict/v2';
+/** Gate A (#34): tingkat verdict domain (QUALIFIED > PARTIAL > FAIL). */
+const DOMAIN_QUALIFIED = 'QUALIFIED';
+const DOMAIN_PARTIAL   = 'PARTIAL';
+const DOMAIN_FAIL      = 'FAIL';
+
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
     'line_tol'     => 0.0,
@@ -107,6 +119,18 @@ $opt = static fn (string $k, $d = null) => $args[$k] ?? $d;
 
 if ($opt('selftest')) {
     exit(selftest());
+}
+
+// GATE A + GATE B (#34): mode audit evidence-contract v2 (tanpa jaringan).
+// Observer `coverage-gate-audit` membangun context JSON dari fakta yang SUDAH ia
+// verifikasi, lalu mode ini (a) menegakkan korelasi identitas secara KERAS (fail-closed)
+// dan (b) memisahkan verdict menjadi EMPAT domain independen + `overall`.
+if (is_string($opt('audit-evidence')) && $opt('audit-evidence') !== '') {
+    exit(auditEvidenceMode(
+        (string) $opt('audit-evidence'),
+        (string) $opt('out-dir', '/tmp/parity'),
+        (bool) $opt('compact', false)
+    ));
 }
 
 $glApi     = rtrim((string) $opt('gl-api', 'https://gitlab.com/api/v4'), '/');
@@ -755,6 +779,361 @@ function classifyRowResult(
     }
     // 6. Lulus.
     return ['PASS', false, false];
+}
+
+// ---------------------------------------------------------------------------
+// GATE A — EVIDENCE CONTRACT v2: verdict dipisah menjadi EMPAT domain + `overall`.
+// GATE B — EXACT EVIDENCE CORRELATION: invariant identitas sebagai ASSERTION KERAS.
+//
+// Latar (#34): verdict tunggal mencampur empat pertanyaan berbeda (paritas eksekusi,
+// ketahanan operasional, kendali merge, kepemilikan kanonik), sehingga temuan kuat pada
+// satu domain dapat menutupi kelemahan pada domain lain. Mode `--audit-evidence=FILE`
+// menerima context JSON yang dibangun observer dari fakta yang SUDAH diverifikasi, lalu:
+//   1. menegakkan invariant identitas B1..B7 — MISMATCH = FAIL KERAS (exit 1); nilai yang
+//      TAK TERSEDIA dilaporkan eksplisit `n/a`, TIDAK dianggap cocok dan tidak dikarang
+//      sebagai kegagalan (artifact GitHub yang kedaluwarsa tidak pernah jadi klaim palsu);
+//   2. menghitung empat domain terpisah + `overall`.
+// Nama status kanonik dan semantik fail-closed TIDAK berubah.
+// ---------------------------------------------------------------------------
+
+/**
+ * Gate B — assertion KERAS korelasi identitas evidence contract.
+ *
+ * Kontrak: MISMATCH = kegagalan (masuk `failures`, memaksa exit 1). Nilai yang TIDAK
+ * TERSEDIA di salah satu sisi = `n/a` (masuk `unavailable`) — tidak dianggap cocok, dan
+ * tidak dikarang sebagai kegagalan. Perbandingan SHA/ID bersifat case-insensitive (hex).
+ *
+ * B1 contract.gitlab_sha      == gitlab.main_sha
+ * B2 contract.pipeline_id     == gitlab.pipeline_id
+ * B3 contract.mirror_sha      == mirror.head_sha
+ * B4 github.head_sha          == contract.mirror_sha   (github_run.head_sha)
+ * B5 contract.run_id          == github.run_id
+ * B6 artifact.workflow_run.id == github.run_id         (artifact.run_id)
+ * B7 contract.artifact_id     == github.artifact_id
+ *
+ * @param array<string,mixed> $ctx context audit (schema AUDIT_CONTEXT_SCHEMA)
+ * @return array{checks:array<int,array{id:string,status:string,detail:string}>,failures:array<int,string>,unavailable:array<int,string>}
+ */
+function assertEvidenceCorrelation(array $ctx): array
+{
+    $checks = [];
+    $failures = [];
+    $unavailable = [];
+    /** @var callable(string,string,mixed,mixed):void $add */
+    $add = static function (string $id, string $label, $a, $b) use (&$checks, &$failures, &$unavailable): void {
+        $av = is_scalar($a) ? trim((string) $a) : '';
+        $bv = is_scalar($b) ? trim((string) $b) : '';
+        if ($av === '' || $bv === '') {
+            $checks[] = ['id' => $id, 'status' => 'n/a', 'detail' => $label . ': n/a (salah satu sisi tidak tersedia)'];
+            $unavailable[] = $id . ' ' . $label;
+            return;
+        }
+        if (strcasecmp($av, $bv) === 0) {
+            $checks[] = ['id' => $id, 'status' => 'OK', 'detail' => $label . ': ' . substr($av, 0, 12) . ' == ' . substr($bv, 0, 12)];
+            return;
+        }
+        $checks[] = ['id' => $id, 'status' => 'FAIL', 'detail' => $label . ': ' . substr($av, 0, 12) . ' != ' . substr($bv, 0, 12)];
+        $failures[] = $id . ' ' . $label . ' (' . substr($av, 0, 12) . ' != ' . substr($bv, 0, 12) . ')';
+    };
+
+    $g = is_array($ctx['gitlab'] ?? null) ? $ctx['gitlab'] : [];
+    $c = is_array($ctx['contract'] ?? null) ? $ctx['contract'] : [];
+    $h = is_array($ctx['github'] ?? null) ? $ctx['github'] : [];
+    $m = is_array($ctx['mirror'] ?? null) ? $ctx['mirror'] : [];
+
+    $add('B1', 'contract.gitlab_sha == gitlab.main_sha', $c['gitlab_sha'] ?? '', $g['main_sha'] ?? '');
+    $add('B2', 'contract.pipeline_id == gitlab.pipeline_id', $c['pipeline_id'] ?? '', $g['pipeline_id'] ?? '');
+    $add('B3', 'contract.mirror_sha == mirror.head_sha', $c['mirror_sha'] ?? '', $m['head_sha'] ?? '');
+    $add('B4', 'github.head_sha == contract.mirror_sha', $h['head_sha'] ?? '', $c['mirror_sha'] ?? '');
+    $add('B5', 'contract.run_id == github.run_id', $c['run_id'] ?? '', $h['run_id'] ?? '');
+    $add('B6', 'artifact.workflow_run.id == github.run_id', $h['artifact_run_id'] ?? '', $h['run_id'] ?? '');
+    $add('B7', 'contract.artifact_id == github.artifact_id', $c['artifact_id'] ?? '', $h['artifact_id'] ?? '');
+
+    return ['checks' => $checks, 'failures' => $failures, 'unavailable' => $unavailable];
+}
+
+/**
+ * Gate A — hitung EMPAT domain verdict terpisah + `overall`.
+ *
+ * Domain (fungsi MURNI — diuji langsung oleh --selftest):
+ *   execution_parity       : paritas keputusan gate GitLab<->GitHub terbukti & korelasi utuh.
+ *   operational_resilience : producer sehat, evidence segar, jalur sumber angka prima.
+ *   merge_control          : ruleset aktif, required check terdaftar, tanpa bypass `always`.
+ *   canonical_ownership    : HEAD GitLab terikat ke mirror HEAD & status kanonik; audit mirror penuh.
+ *
+ * `overall` = FAIL bila ada domain FAIL; QUALIFIED bila keempatnya QUALIFIED; selain itu PARTIAL.
+ *
+ * @param array<string,mixed> $ctx     context audit
+ * @param array<string,mixed> $corr    hasil assertEvidenceCorrelation()
+ * @param array<string,mixed> $parity  ringkasan paritas (opsional: verdict, numeric_not_measured)
+ * @return array<string,array{verdict:string,reasons:array<int,string>}>
+ */
+function computeDomainVerdict(array $ctx, array $corr, array $parity = []): array
+{
+    $g  = is_array($ctx['gitlab'] ?? null) ? $ctx['gitlab'] : [];
+    $c  = is_array($ctx['contract'] ?? null) ? $ctx['contract'] : [];
+    $m  = is_array($ctx['mirror'] ?? null) ? $ctx['mirror'] : [];
+    $s  = is_array($ctx['status'] ?? null) ? $ctx['status'] : [];
+    $mc = is_array($ctx['merge_control'] ?? null) ? $ctx['merge_control'] : [];
+    $corrFail = is_array($corr['failures'] ?? null) ? $corr['failures'] : [];
+    $corrNA   = is_array($corr['unavailable'] ?? null) ? $corr['unavailable'] : [];
+    $numNA    = is_array($parity['numeric_not_measured'] ?? null) ? $parity['numeric_not_measured'] : [];
+    $pv       = strtoupper(trim((string) ($parity['verdict'] ?? '')));
+    $canon    = (string) ($s['canonical_state'] ?? '');
+
+    $domains = [];
+
+    // --- 1. execution_parity ---------------------------------------------
+    $v = DOMAIN_QUALIFIED;
+    $r = [];
+    if ($corrFail !== []) {
+        $v = DOMAIN_FAIL;
+        $r[] = 'evidence-correlation-broken:' . count($corrFail);
+    } elseif ($pv === 'VIOLATION') {
+        $v = DOMAIN_FAIL;
+        $r[] = 'parity-violation';
+    } elseif ($pv === 'ERROR') {
+        $v = DOMAIN_FAIL;
+        $r[] = 'parity-operational-error';
+    } elseif ($pv === '') {
+        $v = DOMAIN_PARTIAL;
+        $r[] = 'parity-verdict-absent';
+    } else {
+        if ($numNA !== []) {
+            $v = DOMAIN_PARTIAL;
+            $r[] = 'numeric-not-measured:' . implode(',', array_unique(array_map('strval', $numNA)));
+        }
+        if ($corrNA !== []) {
+            $v = DOMAIN_PARTIAL;
+            $r[] = 'correlation-na:' . count($corrNA);
+        }
+    }
+    $domains['execution_parity'] = ['verdict' => $v, 'reasons' => $r];
+
+    // --- 2. operational_resilience ----------------------------------------
+    $v = DOMAIN_QUALIFIED;
+    $r = [];
+    $waitSt = trim((string) ($g['wait_job_status'] ?? ''));
+    $offSt  = trim((string) ($g['offload_job_status'] ?? ''));
+    $ageH   = $ctx['freshness_hours'] ?? null;
+    $maxAge = $ctx['max_age_hours'] ?? null;
+    if ($waitSt !== 'success') {
+        $v = DOMAIN_FAIL;
+        $r[] = 'producer-wait-status:' . ($waitSt !== '' ? $waitSt : 'none');
+    }
+    if ($offSt !== 'success') {
+        $v = DOMAIN_FAIL;
+        $r[] = 'producer-offload-status:' . ($offSt !== '' ? $offSt : 'none');
+    }
+    if (is_numeric($ageH) && is_numeric($maxAge) && (float) $ageH > (float) $maxAge) {
+        $v = DOMAIN_FAIL;
+        $r[] = 'evidence-stale:' . $ageH . 'h>' . $maxAge . 'h';
+    }
+    if ($v !== DOMAIN_FAIL) {
+        $cSrc = (string) ($c['coverage_source'] ?? '');
+        if ($cSrc !== '' && $cSrc !== 'gate.txt') {
+            $v = DOMAIN_PARTIAL;
+            $r[] = 'fallback-source:' . $cSrc;
+        }
+        if (!is_numeric($ageH)) {
+            $v = DOMAIN_PARTIAL;
+            $r[] = 'freshness-unmeasured';
+        }
+    }
+    $domains['operational_resilience'] = ['verdict' => $v, 'reasons' => $r];
+
+    // --- 3. merge_control --------------------------------------------------
+    $v = DOMAIN_QUALIFIED;
+    $r = [];
+    $enf = strtolower(trim((string) ($mc['enforcement'] ?? '')));
+    // "no-fake-claims": enforcement KOSONG berarti API ruleset tidak terbaca -> bukti TAK
+    // TERSEDIA (PARTIAL), bukan kegagalan. Keaslian tetap dijaga: kita TIDAK melaporkan
+    // bypass/required-checks yang tidak benar-benar kita baca.
+    if ($enf === '') {
+        $v = DOMAIN_PARTIAL;
+        $r[] = 'merge-control-unmeasured';
+    } else {
+        if ($enf !== 'active') {
+            $v = DOMAIN_FAIL;
+            $r[] = 'ruleset-enforcement:' . $enf;
+        }
+        $checks = is_array($mc['required_checks'] ?? null) ? $mc['required_checks'] : [];
+        if ($checks === []) {
+            $v = DOMAIN_FAIL;
+            $r[] = 'no-required-checks-registered';
+        }
+        $always = [];
+        foreach ((is_array($mc['bypass_actors'] ?? null) ? $mc['bypass_actors'] : []) as $b) {
+            if (is_array($b) && (string) ($b['bypass_mode'] ?? '') === 'always') {
+                $always[] = (string) ($b['actor_id'] ?? '?');
+            }
+        }
+        if ($always !== []) {
+            if ($v !== DOMAIN_FAIL) {
+                $v = DOMAIN_PARTIAL;
+            }
+            $r[] = 'bypass-actor-active:' . implode(',', $always) . '/always';
+        }
+    }
+    if ($canon === '' || $canon === 'missing') {
+        if ($v === DOMAIN_QUALIFIED) {
+            $v = DOMAIN_PARTIAL;
+        }
+        $r[] = 'canonical-status-absent';
+    } elseif ($canon === 'failed' || $canon === 'canceled') {
+        $v = DOMAIN_FAIL;
+        $r[] = 'canonical-status:' . $canon;
+    }
+    $domains['merge_control'] = ['verdict' => $v, 'reasons' => $r];
+
+    // --- 4. canonical_ownership -------------------------------------------
+    $v = DOMAIN_QUALIFIED;
+    $r = [];
+    if (($m['leak'] ?? false) === true) {
+        $v = DOMAIN_FAIL;
+        $r[] = 'mirror-leak';
+    }
+    $nFiles = $m['n_files'] ?? null;
+    $scanned = $m['blobs_scanned'] ?? null;
+    if (is_numeric($nFiles) && is_numeric($scanned) && (int) $scanned < (int) $nFiles) {
+        if ($v !== DOMAIN_FAIL) {
+            $v = DOMAIN_PARTIAL;
+        }
+        $r[] = 'mirror-audit-partial-coverage:' . (int) $scanned . '/' . (int) $nFiles;
+    }
+    if ($corrNA !== []) {
+        if ($v !== DOMAIN_FAIL) {
+            $v = DOMAIN_PARTIAL;
+        }
+        $r[] = 'ownership-correlation-na:' . count($corrNA);
+    }
+    if ($canon === '' || $canon === 'missing') {
+        if ($v !== DOMAIN_FAIL) {
+            $v = DOMAIN_PARTIAL;
+        }
+        $r[] = 'canonical-status-absent';
+    } elseif ($canon === 'failed' || $canon === 'canceled') {
+        $v = DOMAIN_FAIL;
+        $r[] = 'canonical-status:' . $canon;
+    }
+    $domains['canonical_ownership'] = ['verdict' => $v, 'reasons' => $r];
+
+    // --- overall -----------------------------------------------------------
+    $all = array_map(static fn (array $d): string => (string) $d['verdict'], $domains);
+    // Catatan: `array_unique()` mempertahankan KEY asli, sehingga hasilnya TIDAK pernah
+    // sama dengan `[DOMAIN_QUALIFIED]` (key-nya 0,1,2,3). Dua penghitung eksplisit di bawah
+    // benar untuk himpunan domain berapa pun dan tidak bergantung pada reindex. (#34)
+    $nQualified = count(array_keys($all, DOMAIN_QUALIFIED, true));
+    $nFail = count(array_keys($all, DOMAIN_FAIL, true));
+    if ($nFail > 0) {
+        $overall = DOMAIN_FAIL;
+    } elseif ($nQualified === count($all)) {
+        $overall = DOMAIN_QUALIFIED;
+    } else {
+        $overall = DOMAIN_PARTIAL;
+    }
+    $domains['overall'] = ['verdict' => $overall, 'reasons' => $overall === DOMAIN_QUALIFIED ? [] : array_merge(...array_values(array_map(static fn (array $d): array => $d['reasons'], array_filter($domains, static fn (array $d): bool => $d['verdict'] !== DOMAIN_QUALIFIED))))];
+
+    return $domains;
+}
+
+/**
+ * Mode `--audit-evidence=FILE` (Gate A + Gate B).
+ *
+ * Membaca context audit yang dibangun observer, menegakkan korelasi identitas, menghitung
+ * empat domain, mencetak ringkasan yang dapat dibaca manusia, menulis
+ * `domain-verdict.json` ke out-dir, lalu keluar dengan kode:
+ *   0 = tidak ada mismatch korelasi DAN tidak ada domain FAIL;
+ *   1 = mismatch korelasi ATAU ada domain FAIL (fail-closed);
+ *   2 = context tidak terbaca / schema tidak dikenal (error operasional).
+ *
+ * @param string $file  path context JSON
+ * @param string $outDir direktori keluaran
+ * @return int kode keluar
+ */
+function auditEvidenceMode(string $file, string $outDir, bool $compact = false): int
+{
+    if (!is_file($file)) {
+        fwrite(STDERR, "ERROR: context audit tidak ditemukan: {$file}\n");
+        return EXIT_ERROR;
+    }
+    $ctx = json_decode((string) @file_get_contents($file), true);
+    if (!is_array($ctx)) {
+        fwrite(STDERR, "ERROR: context audit bukan objek JSON: {$file}\n");
+        return EXIT_ERROR;
+    }
+    if ((string) ($ctx['schema'] ?? '') !== AUDIT_CONTEXT_SCHEMA) {
+        fwrite(STDERR, 'ERROR: schema context audit tidak dikenal: ' . (string) ($ctx['schema'] ?? '(kosong)') . "\n");
+        return EXIT_ERROR;
+    }
+
+    $corr = assertEvidenceCorrelation($ctx);
+
+    // Ringkasan paritas (opsional) — dipakai domain execution_parity bila tersedia.
+    $parity = [];
+    $pSum = rtrim($outDir, '/') . '/parity-summary.json';
+    if (is_file($pSum)) {
+        $tmp = json_decode((string) @file_get_contents($pSum), true);
+        if (is_array($tmp)) {
+            $parity = $tmp;
+        }
+    }
+
+    $domains = computeDomainVerdict($ctx, $corr, $parity);
+
+    if (!$compact) {
+        echo "== EVIDENCE CONTRACT v2 (Gate A) ==\n";
+        echo '  schema      : ' . (string) ($ctx['schema'] ?? '') . "\n";
+        echo '  observed_at : ' . (string) ($ctx['observed_at'] ?? '') . "\n";
+        echo "== GATE B - EXACT EVIDENCE CORRELATION (assertion keras) ==\n";
+        foreach ($corr['checks'] as $ch) {
+            printf("  %-4s %-3s %s\n", (string) $ch['status'], (string) $ch['id'], (string) $ch['detail']);
+        }
+        echo "== DOMAIN VERDICT ==\n";
+        foreach ($domains as $name => $d) {
+            if ($name === 'overall') {
+                continue;
+            }
+            printf("  %-22s = %s%s\n", $name, (string) $d['verdict'], $d['reasons'] === [] ? '' : '  (' . implode('; ', $d['reasons']) . ')');
+        }
+        printf("  %-22s = %s\n", 'overall', (string) $domains['overall']['verdict']);
+    }
+
+    $payload = [
+        'schema'         => DOMAIN_VERDICT_SCHEMA,
+        'generated_at'   => gmdate('c'),
+        'context_file'   => $file,
+        'correlation'    => $corr,
+        'domains'        => [],
+        'overall'        => ['verdict' => (string) $domains['overall']['verdict'], 'reasons' => $domains['overall']['reasons']],
+        'parity_verdict' => (string) ($parity['verdict'] ?? ''),
+    ];
+    foreach ($domains as $name => $d) {
+        if ($name === 'overall') {
+            continue;
+        }
+        $payload['domains'][$name] = ['verdict' => (string) $d['verdict'], 'reasons' => $d['reasons']];
+    }
+    if (!is_dir($outDir) && !@mkdir($outDir, 0775, true) && !is_dir($outDir)) {
+        fwrite(STDERR, "WARN: tidak bisa membuat direktori {$outDir}\n");
+    } else {
+        $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if (is_string($json)) {
+            @file_put_contents(rtrim($outDir, '/') . '/domain-verdict.json', $json . "\n");
+            echo 'domain-verdict: ' . rtrim($outDir, '/') . "/domain-verdict.json\n";
+        }
+    }
+
+    if ($corr['failures'] !== []) {
+        echo '== EVIDENCE CONTRACT v2: FAIL (korelasi ' . count($corr['failures']) . " mismatch) ==\n";
+        return EXIT_VIOLATION;
+    }
+    if ((string) $domains['overall']['verdict'] === DOMAIN_FAIL) {
+        echo "== EVIDENCE CONTRACT v2: FAIL (ada domain FAIL) ==\n";
+        return EXIT_VIOLATION;
+    }
+    echo '== EVIDENCE CONTRACT v2: ' . (string) $domains['overall']['verdict'] . " ==\n";
+    return EXIT_PASS;
 }
 
 /**
@@ -1668,6 +2047,100 @@ function selftest(): int
     // Lulus bersih.
     [$rPass] = classifyRowResult('OK', 'OK', 'success', 'success', 'complete', 'success', []);
     $ok('Qodo#12 lulus bersih -> PASS', $rPass === 'PASS');
+
+    // -----------------------------------------------------------------------
+    // Gate A (#34) - EMPAT DOMAIN terpisah, bukan satu verdict tunggal.
+    // -----------------------------------------------------------------------
+    $mkCtx = static function (array $over = []): array {
+        $base = [
+            'schema' => AUDIT_CONTEXT_SCHEMA,
+            'observed_at' => '2026-09-12T18:00:00Z',
+            'gitlab' => ['project_id' => '86155206', 'main_sha' => str_repeat('a', 40), 'pipeline_id' => 111, 'source' => 'push',
+                         'wait_job_id' => '222', 'wait_job_status' => 'success', 'wait_job_duration_s' => 233.59,
+                         'offload_job_id' => '333', 'offload_job_status' => 'success', 'offload_job_duration_s' => 36.19],
+            'contract' => ['schema' => 'zef.coverage-gate.evidence/v1', 'gitlab_sha' => str_repeat('a', 40),
+                           'mirror_sha' => str_repeat('b', 40), 'run_id' => '999', 'run_conclusion' => 'success',
+                           'artifact_id' => 'artifact-1', 'coverage_lines_pct' => 86.99, 'coverage_source' => 'gate.txt',
+                           'produced_at' => '2026-09-12T17:55:00Z', 'pipeline_id' => 111],
+            'github' => ['run_id' => '999', 'head_sha' => str_repeat('b', 40), 'conclusion' => 'success',
+                         'artifact_id' => 'artifact-1', 'artifact_run_id' => '999'],
+            'mirror' => ['head_sha' => str_repeat('b', 40), 'n_files' => 552, 'blobs_scanned' => 552, 'leak' => false],
+            'status' => ['canonical_name' => COVERAGE_STATUS_NAME, 'canonical_state' => 'success', 'legacy_state' => 'missing'],
+            'merge_control' => ['enforcement' => 'active', 'bypass_actors' => [],
+                                'required_checks' => [['name' => 'PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)', 'integration_id' => '15368'],
+                                                      ['name' => 'PHPStan level max (GitHub 2 vCPU / 7 GB)', 'integration_id' => '15368']]],
+            'freshness_hours' => 0.2,
+            'max_age_hours' => 168,
+        ];
+        return array_replace_recursive($base, $over);
+    };
+    $ids = static fn (array $list): array => array_map(static fn ($f): string => explode(' ', (string) $f)[0], $list);
+
+    $ok('GateA context bersih -> korelasi tanpa kegagalan', assertEvidenceCorrelation($mkCtx())['failures'] === []
+        && assertEvidenceCorrelation($mkCtx())['unavailable'] === []);
+    $domQ = computeDomainVerdict($mkCtx(), assertEvidenceCorrelation($mkCtx()), ['verdict' => 'PASS', 'numeric_not_measured' => []]);
+    $ok('GateA context bersih -> overall QUALIFIED', $domQ['overall']['verdict'] === DOMAIN_QUALIFIED);
+    $ok('GateA context bersih -> 4 domain semua QUALIFIED', $domQ['execution_parity']['verdict'] === DOMAIN_QUALIFIED
+        && $domQ['operational_resilience']['verdict'] === DOMAIN_QUALIFIED
+        && $domQ['merge_control']['verdict'] === DOMAIN_QUALIFIED
+        && $domQ['canonical_ownership']['verdict'] === DOMAIN_QUALIFIED);
+    // Bypass actor `always` -> merge_control PARTIAL; domain lain TIDAK ikut turun.
+    $bwCtx = $mkCtx(['merge_control' => ['bypass_actors' => [['actor_id' => '4911046', 'actor_type' => 'Integration', 'bypass_mode' => 'always']]]]);
+    $bwDom = computeDomainVerdict($bwCtx, assertEvidenceCorrelation($bwCtx), ['verdict' => 'PASS']);
+    $ok('GateA bypass always -> merge_control PARTIAL', $bwDom['merge_control']['verdict'] === DOMAIN_PARTIAL);
+    $ok('GateA bypass always -> overall PARTIAL (bukan QUALIFIED)', $bwDom['overall']['verdict'] === DOMAIN_PARTIAL);
+    $ok('GateA bypass always -> canonical_ownership tetap QUALIFIED', $bwDom['canonical_ownership']['verdict'] === DOMAIN_QUALIFIED);
+    // Audit mirror belum penuh -> canonical_ownership PARTIAL (Gate C masih terbuka).
+    $miCtx = $mkCtx(['mirror' => ['blobs_scanned' => 120, 'n_files' => 552]]);
+    $miDom = computeDomainVerdict($miCtx, assertEvidenceCorrelation($miCtx), ['verdict' => 'PASS']);
+    $ok('GateA mirror 120/552 -> canonical_ownership PARTIAL', $miDom['canonical_ownership']['verdict'] === DOMAIN_PARTIAL);
+    $ok('GateA mirror 120/552 -> alasan memuat rasio', in_array('mirror-audit-partial-coverage:120/552', $miDom['canonical_ownership']['reasons'], true));
+    // Paritas VIOLATION -> execution_parity FAIL, overall FAIL (tidak ditutupi domain lain).
+    $pvDom = computeDomainVerdict($mkCtx(), assertEvidenceCorrelation($mkCtx()), ['verdict' => 'VIOLATION']);
+    $ok('GateA paritas VIOLATION -> execution_parity FAIL', $pvDom['execution_parity']['verdict'] === DOMAIN_FAIL);
+    $ok('GateA paritas VIOLATION -> overall FAIL', $pvDom['overall']['verdict'] === DOMAIN_FAIL);
+    // Producer merah -> operational_resilience FAIL.
+    $prCtx = $mkCtx(['gitlab' => ['wait_job_status' => 'failed']]);
+    $prDom = computeDomainVerdict($prCtx, assertEvidenceCorrelation($prCtx), ['verdict' => 'PASS']);
+    $ok('GateA producer merah -> operational_resilience FAIL', $prDom['operational_resilience']['verdict'] === DOMAIN_FAIL);
+    // Fallback sumber angka -> operational_resilience PARTIAL (bukan gagal).
+    $fbCtx = $mkCtx(['contract' => ['coverage_source' => 'coverage.txt']]);
+    $fbDom = computeDomainVerdict($fbCtx, assertEvidenceCorrelation($fbCtx), ['verdict' => 'PASS']);
+    $ok('GateA fallback coverage.txt -> operational_resilience PARTIAL', $fbDom['operational_resilience']['verdict'] === DOMAIN_PARTIAL);
+    // "no-fake-claims": ruleset tak terbaca -> PARTIAL (bukti tak tersedia), bukan FAIL.
+    $mmCtx = $mkCtx(['merge_control' => ['enforcement' => '', 'required_checks' => [], 'bypass_actors' => []]]);
+    $mmDom = computeDomainVerdict($mmCtx, assertEvidenceCorrelation($mmCtx), ['verdict' => 'PASS']);
+    $ok('GateA ruleset tak terbaca -> merge_control PARTIAL (bukan FAIL)', $mmDom['merge_control']['verdict'] === DOMAIN_PARTIAL);
+    $ok('GateA ruleset tak terbaca -> alasan merge-control-unmeasured', in_array('merge-control-unmeasured', $mmDom['merge_control']['reasons'], true));
+    $ok('GateA ruleset tak terbaca -> overall PARTIAL', $mmDom['overall']['verdict'] === DOMAIN_PARTIAL);
+    // enforcement non-aktif DIBACA -> kegagalan keras (bukan lagi "tak terukur").
+    $meCtx = $mkCtx(['merge_control' => ['enforcement' => 'evaluate']]);
+    $meDom = computeDomainVerdict($meCtx, assertEvidenceCorrelation($meCtx), ['verdict' => 'PASS']);
+    $ok('GateA enforcement=evaluate -> merge_control FAIL', $meDom['merge_control']['verdict'] === DOMAIN_FAIL);
+
+    // -----------------------------------------------------------------------
+    // Gate B (#34) - korelasi identitas sebagai ASSERTION KERAS.
+    // -----------------------------------------------------------------------
+    $b1 = assertEvidenceCorrelation($mkCtx(['contract' => ['gitlab_sha' => str_repeat('c', 40)]]));
+    $ok('GateB B1 mismatch gitlab_sha -> kegagalan keras', in_array('B1', $ids($b1['failures']), true));
+    $b3 = assertEvidenceCorrelation($mkCtx(['mirror' => ['head_sha' => str_repeat('e', 40)]]));
+    $ok('GateB B3 mismatch mirror.head_sha -> kegagalan keras', in_array('B3', $ids($b3['failures']), true));
+    $b4 = assertEvidenceCorrelation($mkCtx(['github' => ['head_sha' => str_repeat('d', 40)]]));
+    $ok('GateB B4 mismatch github.head_sha -> kegagalan keras', in_array('B4', $ids($b4['failures']), true));
+    $b6 = assertEvidenceCorrelation($mkCtx(['github' => ['artifact_run_id' => '12345']]));
+    $ok('GateB B6 mismatch artifact.run_id -> kegagalan keras', in_array('B6', $ids($b6['failures']), true));
+    $b2 = assertEvidenceCorrelation($mkCtx(['contract' => ['pipeline_id' => 222]]));
+    $ok('GateB B2 mismatch pipeline_id -> kegagalan keras', in_array('B2', $ids($b2['failures']), true));
+    // Nilai TAK TERSEDIA (artifact GitHub kedaluwarsa) -> n/a, BUKAN kegagalan.
+    $bna = assertEvidenceCorrelation($mkCtx(['github' => ['artifact_id' => '']]));
+    $ok('GateB nilai tak tersedia -> n/a (bukan kegagalan keras)', $bna['failures'] === [] && in_array('B7', $ids($bna['unavailable']), true));
+    // Korelasi gagal -> execution_parity FAIL, overall FAIL.
+    $cfDom = computeDomainVerdict($mkCtx(['contract' => ['gitlab_sha' => str_repeat('c', 40)]]), $b1, ['verdict' => 'PASS']);
+    $ok('GateB korelasi gagal -> execution_parity FAIL', $cfDom['execution_parity']['verdict'] === DOMAIN_FAIL);
+    $ok('GateB korelasi gagal -> overall FAIL', $cfDom['overall']['verdict'] === DOMAIN_FAIL);
+    // Identitas sama namun beda kapitalisasi hex -> tetap cocok (bukan kegagalan palsu).
+    $bcase = assertEvidenceCorrelation($mkCtx(['contract' => ['mirror_sha' => strtoupper(str_repeat('b', 40))]]));
+    $ok('GateB hex beda kapitalisasi -> tetap cocok', $bcase['failures'] === []);
 
     echo $fail === 0 ? "== selftest: LULUS ==\n" : "== selftest: {$fail} GAGAL ==\n";
     return $fail === 0 ? EXIT_PASS : EXIT_VIOLATION;
