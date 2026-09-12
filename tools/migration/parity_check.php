@@ -979,6 +979,14 @@ function computeDomainVerdict(array $ctx, array $corr, array $parity = []): arra
     $v = DOMAIN_QUALIFIED;
     $r = [];
     $enf = strtolower(trim((string) ($mc['enforcement'] ?? '')));
+    // Gate E (#37): klasifikasi KETERLIHATAN bypass. Diinisialisasi di sini supaya tetap
+    // terdefinisi pada jalur "API ruleset tak terbaca" - tiadanya bukti tidak boleh menjadi
+    // undefined, dan tidak boleh pula disamakan dengan bukti ketiadaan.
+    $visibility = 'unknown-unreadable';
+    $enfRead = ($enf !== ''); // enforcement terbaca = API ruleset benar-benar menjawab
+    $obs = ['visibility' => 'unknown-unreadable', 'bypass_actors_known' => false,
+            'current_user_can_bypass' => (string) ($mc['current_user_can_bypass'] ?? ''),
+            'keys' => [], 'actor_ids' => []];
     // "no-fake-claims": enforcement KOSONG berarti API ruleset tidak terbaca -> bukti TAK
     // TERSEDIA (PARTIAL), bukan kegagalan. Keaslian tetap dijaga: kita TIDAK melaporkan
     // bypass/required-checks yang tidak benar-benar kita baca.
@@ -996,29 +1004,47 @@ function computeDomainVerdict(array $ctx, array $corr, array $parity = []): arra
             $r[] = 'no-required-checks-registered';
         }
         $always = [];
+        foreach ((is_array($mc['bypass_actors'] ?? null) ? $mc['bypass_actors'] : []) as $b) {
+            if (is_array($b) && (string) ($b['bypass_mode'] ?? '') === 'always') {
+                $always[] = (string) ($b['actor_id'] ?? '?');
+            }
+        }
         // "no-fake-claims": `bypass_actors_known=false` berarti daftar bypass TIDAK terlihat
         // oleh kredensial yang dipakai (mis. token App instalasi) - itu bukti TAK TERSEDIA,
         // BUKAN bukti ketiadaan. Tanpa flag ini domain akan salah menyatakan QUALIFIED
         // padahal bypass `always` masih ada. Dicatat PARTIAL + alasan eksplisit.
         $bypassKnown = ($mc['bypass_actors_known'] ?? null) === true;
-        if (!$bypassKnown) {
+        // Gate E (#37): EMPAT keadaan keterlihatan dibedakan tegas & terekam, supaya
+        // "field tak terlihat" tidak pernah menyamar sebagai "tidak ada bypass":
+        //   - unknown-unreadable : field tak ada DAN enforcement tak terbaca -> API tak terbaca
+        //   - hidden-but-gated   : field tak ada TAPI enforcement terbaca     -> dibatasi API
+        //   - measured-empty     : field ADA dan kosong -> ketiadaan TERBUKTI
+        //   - measured-active    : field ADA dan berisi bypass -> bypass nyata
+        $keys = is_array($mc['keys'] ?? null) ? $mc['keys'] : [];
+        $canBypass = (string) ($mc['current_user_can_bypass'] ?? '');
+        if ($canBypass !== '' && !in_array('current_user_can_bypass', $keys, true)) {
+            $keys[] = 'current_user_can_bypass'; // kunci ini memang dibaca -> bukti keterlihatan
+        }
+        if (!$enfRead) {
+            $visibility = 'unknown-unreadable';
+        } elseif ($bypassKnown) {
+            $visibility = $always === [] ? 'measured-empty' : 'measured-active';
+        } else {
+            $visibility = 'hidden-but-gated';
+        }
+        if ($visibility !== 'measured-empty') {
             if ($v !== DOMAIN_FAIL) {
                 $v = DOMAIN_PARTIAL;
             }
             $r[] = 'bypass-actors-unmeasured';
-        } else {
-            foreach ((is_array($mc['bypass_actors'] ?? null) ? $mc['bypass_actors'] : []) as $b) {
-                if (is_array($b) && (string) ($b['bypass_mode'] ?? '') === 'always') {
-                    $always[] = (string) ($b['actor_id'] ?? '?');
-                }
-            }
-            if ($always !== []) {
-                if ($v !== DOMAIN_FAIL) {
-                    $v = DOMAIN_PARTIAL;
-                }
-                $r[] = 'bypass-actor-active:' . implode(',', $always) . '/always';
-            }
+            $r[] = 'bypass-visibility:' . $visibility . ($canBypass === '' ? '' : '/can_bypass=' . $canBypass);
         }
+        if ($visibility === 'measured-active') {
+            $r[] = 'bypass-actor-active:' . implode(',', $always) . '/always';
+        }
+        $obs = ['visibility' => $visibility, 'bypass_actors_known' => $bypassKnown,
+                'current_user_can_bypass' => $canBypass, 'keys' => array_values(array_unique($keys)),
+                'actor_ids' => $always];
     }
     if ($canon === '' || $canon === 'missing') {
         if ($v === DOMAIN_QUALIFIED) {
@@ -1029,7 +1055,7 @@ function computeDomainVerdict(array $ctx, array $corr, array $parity = []): arra
         $v = DOMAIN_FAIL;
         $r[] = 'canonical-status:' . $canon;
     }
-    $domains['merge_control'] = ['verdict' => $v, 'reasons' => $r];
+    $domains['merge_control'] = ['verdict' => $v, 'reasons' => $r, 'observability' => $obs];
 
     // --- 4. canonical_ownership -------------------------------------------
     $v = DOMAIN_QUALIFIED;
@@ -1202,6 +1228,9 @@ function auditEvidenceMode(string $file, string $outDir, bool $compact = false):
             continue;
         }
         $payload['domains'][$name] = ['verdict' => (string) $d['verdict'], 'reasons' => $d['reasons']];
+        if (isset($d['observability']) && is_array($d['observability'])) {
+            $payload['domains'][$name]['observability'] = $d['observability'];
+        }
     }
     if (!is_dir($outDir) && !@mkdir($outDir, 0775, true) && !is_dir($outDir)) {
         fwrite(STDERR, "WARN: tidak bisa membuat direktori {$outDir}\n");
@@ -2660,6 +2689,31 @@ function selftest(): int
     $s3nc = computeStage3cVerdict($mkWin(['window' => ['commits_in_window' => 12, 'days_elapsed' => null]], 12));
     $ok('GateD hari tak terukur tapi commit>=min -> tetap QUALIFIED (jalur commit)',
         $s3nc['verdict'] === STAGE3C_QUALIFIED && $s3nc['window_satisfied'] === true);
+
+    // -----------------------------------------------------------------------
+    // Gate E (#37) - klasifikasi KETERLIHATAN bypass (read-only; TIDAK mengubah
+    // ruleset). Tujuan: "field tak terlihat" tidak pernah menyamar sebagai
+    // "tidak ada bypass"; keempat keadaan dibedakan tegas dan terekam.
+    // -----------------------------------------------------------------------
+    $eAct = computeDomainVerdict($bwCtx, assertEvidenceCorrelation($bwCtx), ['verdict' => 'PASS']);
+    $ok('GateE bypass selalu aktif & terukur -> visibility=measured-active',
+        ($eAct['merge_control']['observability']['visibility'] ?? '') === 'measured-active');
+    $ok('GateE bypass aktif -> verdict tetap PARTIAL (klasifikasi tak menaikkan verdict)',
+        $eAct['merge_control']['verdict'] === DOMAIN_PARTIAL);
+    $ok('GateE field tak terlihat -> visibility=hidden-but-gated',
+        ($buDom['merge_control']['observability']['visibility'] ?? '') === 'hidden-but-gated');
+    $ok('GateE API tak terbaca -> visibility=unknown-unreadable',
+        ($mmDom['merge_control']['observability']['visibility'] ?? '') === 'unknown-unreadable');
+    $ok('GateE terukur & kosong -> visibility=measured-empty',
+        ($bvDom['merge_control']['observability']['visibility'] ?? '') === 'measured-empty');
+    $eCtx = $mkCtx(['merge_control' => ['current_user_can_bypass' => 'never', 'keys' => ['_links', 'enforcement']]]);
+    $eCDom = computeDomainVerdict($eCtx, assertEvidenceCorrelation($eCtx), ['verdict' => 'PASS']);
+    $ok('GateE current_user_can_bypass direkam APA ADANYA',
+        ($eCDom['merge_control']['observability']['current_user_can_bypass'] ?? '') === 'never');
+    $ok('GateE daftar kunci ruleset ikut terekam',
+        in_array('current_user_can_bypass', $eCDom['merge_control']['observability']['keys'] ?? [], true));
+    $ok('GateE actor_ids terekam pada jalur terukur',
+        ($eAct['merge_control']['observability']['actor_ids'] ?? []) === ['4911046']);
 
     echo $fail === 0 ? "== selftest: LULUS ==\n" : "== selftest: {$fail} GAGAL ==\n";
     return $fail === 0 ? EXIT_PASS : EXIT_VIOLATION;
