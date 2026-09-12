@@ -19,6 +19,9 @@
 #
 # PARITAS dengan job phpstan lama di .gitlab-ci.yml zeflous/zef:
 #   - PHP 8.4 + Composer 2.10.3 (pin) + composer install dari composer.lock
+#   - composer validate --strict --no-check-publish --no-check-version
+#     (paritas 1:1 dgn job composer-validate GitLab; --no-check-version WAJIB
+#     karena marker versi internal repo "v250B1" bukan semver)
 #   - vendor/bin/phpstan analyse --configuration phpstan.neon.dist --no-progress
 #     --error-format=gitlab  -> var/phpstan/phpstan-report.json
 #     (format gitlab = Code Quality JSON, kompatibel dgn artifact lama)
@@ -90,7 +93,13 @@ jobs:
           composer --version
 
       - name: composer validate
-        run: composer validate --strict --no-check-publish
+        # --no-check-version: marker versi internal repo ("version": "v250B1")
+        # sengaja bukan semver; paritas 1:1 dengan job composer-validate GitLab
+        # (.gitlab-ci.yml: composer validate --strict --no-check-publish
+        #  --no-check-version). Tanpa flag ini `--strict` meng-exit 1 di sini
+        # sehingga PHPStan TIDAK PERNAH dieksekusi (RCA kegagalan run
+        # 34676227454).
+        run: composer validate --strict --no-check-publish --no-check-version
 
       - name: composer install (from lock)
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
