@@ -963,16 +963,28 @@ function computeDomainVerdict(array $ctx, array $corr, array $parity = []): arra
             $r[] = 'no-required-checks-registered';
         }
         $always = [];
-        foreach ((is_array($mc['bypass_actors'] ?? null) ? $mc['bypass_actors'] : []) as $b) {
-            if (is_array($b) && (string) ($b['bypass_mode'] ?? '') === 'always') {
-                $always[] = (string) ($b['actor_id'] ?? '?');
-            }
-        }
-        if ($always !== []) {
+        // "no-fake-claims": `bypass_actors_known=false` berarti daftar bypass TIDAK terlihat
+        // oleh kredensial yang dipakai (mis. token App instalasi) - itu bukti TAK TERSEDIA,
+        // BUKAN bukti ketiadaan. Tanpa flag ini domain akan salah menyatakan QUALIFIED
+        // padahal bypass `always` masih ada. Dicatat PARTIAL + alasan eksplisit.
+        $bypassKnown = ($mc['bypass_actors_known'] ?? null) === true;
+        if (!$bypassKnown) {
             if ($v !== DOMAIN_FAIL) {
                 $v = DOMAIN_PARTIAL;
             }
-            $r[] = 'bypass-actor-active:' . implode(',', $always) . '/always';
+            $r[] = 'bypass-actors-unmeasured';
+        } else {
+            foreach ((is_array($mc['bypass_actors'] ?? null) ? $mc['bypass_actors'] : []) as $b) {
+                if (is_array($b) && (string) ($b['bypass_mode'] ?? '') === 'always') {
+                    $always[] = (string) ($b['actor_id'] ?? '?');
+                }
+            }
+            if ($always !== []) {
+                if ($v !== DOMAIN_FAIL) {
+                    $v = DOMAIN_PARTIAL;
+                }
+                $r[] = 'bypass-actor-active:' . implode(',', $always) . '/always';
+            }
         }
     }
     if ($canon === '' || $canon === 'missing') {
@@ -2066,7 +2078,7 @@ function selftest(): int
                          'artifact_id' => 'artifact-1', 'artifact_run_id' => '999'],
             'mirror' => ['head_sha' => str_repeat('b', 40), 'n_files' => 552, 'blobs_scanned' => 552, 'leak' => false],
             'status' => ['canonical_name' => COVERAGE_STATUS_NAME, 'canonical_state' => 'success', 'legacy_state' => 'missing'],
-            'merge_control' => ['enforcement' => 'active', 'bypass_actors' => [],
+            'merge_control' => ['enforcement' => 'active', 'bypass_actors' => [], 'bypass_actors_known' => true,
                                 'required_checks' => [['name' => 'PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)', 'integration_id' => '15368'],
                                                       ['name' => 'PHPStan level max (GitHub 2 vCPU / 7 GB)', 'integration_id' => '15368']]],
             'freshness_hours' => 0.2,
@@ -2117,6 +2129,21 @@ function selftest(): int
     $meCtx = $mkCtx(['merge_control' => ['enforcement' => 'evaluate']]);
     $meDom = computeDomainVerdict($meCtx, assertEvidenceCorrelation($meCtx), ['verdict' => 'PASS']);
     $ok('GateA enforcement=evaluate -> merge_control FAIL', $meDom['merge_control']['verdict'] === DOMAIN_FAIL);
+    // "no-fake-claims": daftar bypass TIDAK terlihat (token App) -> PARTIAL, BUKAN QUALIFIED.
+    // Ini mencegah klaim palsu "tanpa bypass" ketika buktinya sekadar tidak terbaca.
+    $buCtx = $mkCtx(['merge_control' => ['enforcement' => 'active',
+        'required_checks' => [['name' => 'PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)']],
+        'bypass_actors' => [], 'bypass_actors_known' => false]]);
+    $buDom = computeDomainVerdict($buCtx, assertEvidenceCorrelation($buCtx), ['verdict' => 'PASS']);
+    $ok('GateA bypass tak terlihat -> merge_control PARTIAL (bukan QUALIFIED)', $buDom['merge_control']['verdict'] === DOMAIN_PARTIAL);
+    $ok('GateA bypass tak terlihat -> alasan bypass-actors-unmeasured', in_array('bypass-actors-unmeasured', $buDom['merge_control']['reasons'], true));
+    $ok('GateA bypass tak terlihat -> overall PARTIAL', $buDom['overall']['verdict'] === DOMAIN_PARTIAL);
+    // Kontras: daftar bypass TERLIHAT dan kosong -> QUALIFIED (ketiadaan TERBUKTI, bukan asumsi).
+    $bvCtx = $mkCtx(['merge_control' => ['enforcement' => 'active',
+        'required_checks' => [['name' => 'PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)']],
+        'bypass_actors' => [], 'bypass_actors_known' => true]]);
+    $bvDom = computeDomainVerdict($bvCtx, assertEvidenceCorrelation($bvCtx), ['verdict' => 'PASS']);
+    $ok('GateA bypass terbaca & kosong -> merge_control QUALIFIED', $bvDom['merge_control']['verdict'] === DOMAIN_QUALIFIED);
 
     // -----------------------------------------------------------------------
     // Gate B (#34) - korelasi identitas sebagai ASSERTION KERAS.
