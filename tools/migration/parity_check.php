@@ -1007,6 +1007,50 @@ function computeDomainVerdict(array $ctx, array $corr, array $parity = []): arra
     }
     $nFiles = $m['n_files'] ?? null;
     $scanned = $m['blobs_scanned'] ?? null;
+    // Gate C (#35) R6-A: aritmetika manifest EKSAK. Kontraknya enumerated == audited ==
+    // whitelisted dengan TEMUAN kosong. Bila observer mengirim trio lengkap, KETIGA-TIGANYA
+    // harus sama - selisih ATAU temuan apa pun = pelanggaran keras (bukan sekadar "cakupan
+    // sebagian"), karena satu-satunya cara ketiganya sama adalah enumerasi penuh yang utuh.
+    // Bila trio TIDAK dikirim, kontrak Gate C belum ditegakkan -> PARTIAL eksplisit,
+    // bukan QUALIFIED diam-diam (fail-closed: ketiadaan bukti != bukti kelengkapan).
+    $enum = $m['blobs_enumerated'] ?? null;
+    $aud  = $m['blobs_audited'] ?? null;
+    $whi  = $m['blobs_whitelisted'] ?? null;
+    $fUnexpected = (int) ($m['findings_unexpected'] ?? 0);
+    $fMissing    = (int) ($m['findings_missing'] ?? 0);
+    $fSecret     = (int) ($m['secret_found'] ?? 0);
+    $fFetchErr   = (int) ($m['fetch_errors'] ?? 0);
+    $hasTrio = is_numeric($enum) && is_numeric($aud) && is_numeric($whi);
+    if ($hasTrio) {
+        $e = (int) $enum;
+        $a = (int) $aud;
+        $w = (int) $whi;
+        if ($e !== $a || $a !== $w) {
+            $v = DOMAIN_FAIL;
+            $r[] = 'manifest-arithmetic-broken:' . $e . '/' . $a . '/' . $w;
+        }
+        if ($fUnexpected !== 0) {
+            $v = DOMAIN_FAIL;
+            $r[] = 'mirror-unexpected-blobs:' . $fUnexpected;
+        }
+        if ($fMissing !== 0) {
+            $v = DOMAIN_FAIL;
+            $r[] = 'mirror-missing-blobs:' . $fMissing;
+        }
+        if ($fSecret !== 0) {
+            $v = DOMAIN_FAIL;
+            $r[] = 'mirror-secret-found:' . $fSecret;
+        }
+        if ($fFetchErr !== 0) {
+            $v = DOMAIN_FAIL;
+            $r[] = 'mirror-fetch-errors:' . $fFetchErr;
+        }
+    } else {
+        if ($v !== DOMAIN_FAIL) {
+            $v = DOMAIN_PARTIAL;
+        }
+        $r[] = 'manifest-contract-absent';
+    }
     if (is_numeric($nFiles) && is_numeric($scanned) && (int) $scanned < (int) $nFiles) {
         if ($v !== DOMAIN_FAIL) {
             $v = DOMAIN_PARTIAL;
@@ -2076,7 +2120,10 @@ function selftest(): int
                            'produced_at' => '2026-09-12T17:55:00Z', 'pipeline_id' => 111],
             'github' => ['run_id' => '999', 'head_sha' => str_repeat('b', 40), 'conclusion' => 'success',
                          'artifact_id' => 'artifact-1', 'artifact_run_id' => '999'],
-            'mirror' => ['head_sha' => str_repeat('b', 40), 'n_files' => 552, 'blobs_scanned' => 552, 'leak' => false],
+            'mirror' => ['head_sha' => str_repeat('b', 40), 'n_files' => 552, 'blobs_scanned' => 552, 'leak' => false,
+                         'blobs_enumerated' => 552, 'blobs_audited' => 552, 'blobs_whitelisted' => 552,
+                         'findings_unexpected' => 0, 'findings_missing' => 0, 'self_pattern_hits' => 1,
+                         'secret_found' => 0, 'fetch_errors' => 0],
             'status' => ['canonical_name' => COVERAGE_STATUS_NAME, 'canonical_state' => 'success', 'legacy_state' => 'missing'],
             'merge_control' => ['enforcement' => 'active', 'bypass_actors' => [], 'bypass_actors_known' => true,
                                 'required_checks' => [['name' => 'PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)', 'integration_id' => '15368'],
@@ -2107,6 +2154,62 @@ function selftest(): int
     $miDom = computeDomainVerdict($miCtx, assertEvidenceCorrelation($miCtx), ['verdict' => 'PASS']);
     $ok('GateA mirror 120/552 -> canonical_ownership PARTIAL', $miDom['canonical_ownership']['verdict'] === DOMAIN_PARTIAL);
     $ok('GateA mirror 120/552 -> alasan memuat rasio', in_array('mirror-audit-partial-coverage:120/552', $miDom['canonical_ownership']['reasons'], true));
+
+    // -----------------------------------------------------------------------
+    // Gate C (#35) R6-A - ENUMERASI PENUH: enumerated == audited == whitelisted.
+    // -----------------------------------------------------------------------
+    // Kontrak lengkap & setara, tanpa temuan -> canonical_ownership QUALIFIED (naik dari PARTIAL).
+    $gcClean = $mkCtx(['mirror' => ['n_files' => 552, 'blobs_scanned' => 552, 'leak' => false,
+        'blobs_enumerated' => 552, 'blobs_audited' => 552, 'blobs_whitelisted' => 552,
+        'findings_unexpected' => 0, 'findings_missing' => 0, 'self_pattern_hits' => 1,
+        'secret_found' => 0, 'fetch_errors' => 0]]);
+    $gcCleanDom = computeDomainVerdict($gcClean, assertEvidenceCorrelation($gcClean), ['verdict' => 'PASS']);
+    $ok('GateC trio 552/552/552 -> canonical_ownership QUALIFIED', $gcCleanDom['canonical_ownership']['verdict'] === DOMAIN_QUALIFIED);
+    $ok('GateC self-pattern bukan leak -> tidak menurunkan domain', $gcCleanDom['canonical_ownership']['reasons'] === []);
+    // Aritmetika tak setara (audited < enumerated) -> FAIL keras, bukan PARTIAL.
+    $gcArith = $mkCtx(['mirror' => ['n_files' => 552, 'blobs_scanned' => 551, 'leak' => false,
+        'blobs_enumerated' => 552, 'blobs_audited' => 551, 'blobs_whitelisted' => 552,
+        'findings_unexpected' => 0, 'findings_missing' => 0, 'secret_found' => 0, 'fetch_errors' => 0]]);
+    $gcArithDom = computeDomainVerdict($gcArith, assertEvidenceCorrelation($gcArith), ['verdict' => 'PASS']);
+    $ok('GateC aritmetika 552/551/552 -> canonical_ownership FAIL', $gcArithDom['canonical_ownership']['verdict'] === DOMAIN_FAIL);
+    $ok('GateC aritmetika pecah -> alasan manifest-arithmetic-broken', in_array('manifest-arithmetic-broken:552/551/552', $gcArithDom['canonical_ownership']['reasons'], true));
+    $ok('GateC aritmetika pecah -> overall FAIL', $gcArithDom['overall']['verdict'] === DOMAIN_FAIL);
+    // Blob di luar manifest = TEMUAN -> FAIL (tidak diabaikan).
+    $gcUn = $mkCtx(['mirror' => ['n_files' => 553, 'blobs_scanned' => 553, 'leak' => true,
+        'blobs_enumerated' => 553, 'blobs_audited' => 553, 'blobs_whitelisted' => 553,
+        'findings_unexpected' => 1, 'findings_missing' => 0, 'secret_found' => 0, 'fetch_errors' => 0]]);
+    $gcUnDom = computeDomainVerdict($gcUn, assertEvidenceCorrelation($gcUn), ['verdict' => 'PASS']);
+    $ok('GateC blob di luar manifest -> FAIL + mirror-unexpected-blobs', $gcUnDom['canonical_ownership']['verdict'] === DOMAIN_FAIL
+        && in_array('mirror-unexpected-blobs:1', $gcUnDom['canonical_ownership']['reasons'], true));
+    // Path manifest hilang dari mirror -> TEMUAN -> FAIL.
+    $gcMi = $mkCtx(['mirror' => ['n_files' => 551, 'blobs_scanned' => 551, 'leak' => false,
+        'blobs_enumerated' => 551, 'blobs_audited' => 551, 'blobs_whitelisted' => 552,
+        'findings_unexpected' => 0, 'findings_missing' => 1, 'secret_found' => 0, 'fetch_errors' => 0]]);
+    $gcMiDom = computeDomainVerdict($gcMi, assertEvidenceCorrelation($gcMi), ['verdict' => 'PASS']);
+    $ok('GateC manifest hilang di mirror -> FAIL + mirror-missing-blobs', $gcMiDom['canonical_ownership']['verdict'] === DOMAIN_FAIL
+        && in_array('mirror-missing-blobs:1', $gcMiDom['canonical_ownership']['reasons'], true));
+    // Secret nyata -> FAIL; fetch error -> FAIL (klaim teraudit tidak sah bila blob tak terbaca).
+    $gcSec = $mkCtx(['mirror' => ['n_files' => 552, 'blobs_scanned' => 552, 'leak' => true,
+        'blobs_enumerated' => 552, 'blobs_audited' => 552, 'blobs_whitelisted' => 552,
+        'findings_unexpected' => 0, 'findings_missing' => 0, 'secret_found' => 1, 'fetch_errors' => 0]]);
+    $gcSecDom = computeDomainVerdict($gcSec, assertEvidenceCorrelation($gcSec), ['verdict' => 'PASS']);
+    $ok('GateC secret ditemukan -> FAIL', $gcSecDom['canonical_ownership']['verdict'] === DOMAIN_FAIL
+        && in_array('mirror-secret-found:1', $gcSecDom['canonical_ownership']['reasons'], true));
+    $gcFe = $mkCtx(['mirror' => ['n_files' => 552, 'blobs_scanned' => 552, 'leak' => false,
+        'blobs_enumerated' => 552, 'blobs_audited' => 550, 'blobs_whitelisted' => 552,
+        'findings_unexpected' => 0, 'findings_missing' => 0, 'secret_found' => 0, 'fetch_errors' => 2]]);
+    $gcFeDom = computeDomainVerdict($gcFe, assertEvidenceCorrelation($gcFe), ['verdict' => 'PASS']);
+    $ok('GateC fetch error -> FAIL (tak boleh klaim teraudit)', $gcFeDom['canonical_ownership']['verdict'] === DOMAIN_FAIL
+        && in_array('mirror-fetch-errors:2', $gcFeDom['canonical_ownership']['reasons'], true));
+    // Tanpa trio (context sebelum Gate C) -> PARTIAL eksplisit, BUKAN QUALIFIED diam-diam.
+    // Catatan: array_replace_recursive TIDAK menghapus kunci, jadi trio harus di-unset
+    // langsung dari context hasil (bukan lewat override $mkCtx).
+    $gcAbs = $mkCtx();
+    unset($gcAbs['mirror']['blobs_enumerated'], $gcAbs['mirror']['blobs_audited'], $gcAbs['mirror']['blobs_whitelisted']);
+    $gcAbsDom = computeDomainVerdict($gcAbs, assertEvidenceCorrelation($gcAbs), ['verdict' => 'PASS']);
+    $ok('GateC trio absen -> PARTIAL + manifest-contract-absent (fail-closed)',
+        $gcAbsDom['canonical_ownership']['verdict'] === DOMAIN_PARTIAL
+        && in_array('manifest-contract-absent', $gcAbsDom['canonical_ownership']['reasons'], true));
     // Paritas VIOLATION -> execution_parity FAIL, overall FAIL (tidak ditutupi domain lain).
     $pvDom = computeDomainVerdict($mkCtx(), assertEvidenceCorrelation($mkCtx()), ['verdict' => 'VIOLATION']);
     $ok('GateA paritas VIOLATION -> execution_parity FAIL', $pvDom['execution_parity']['verdict'] === DOMAIN_FAIL);
