@@ -30,22 +30,12 @@ declare(strict_types=1);
  *   0 — All invariants hold (no drift, no new debt).
  *   1 — Drift detected (new unbaselined errors OR baseline exceeded floor).
  *   2 — Configuration error (missing snapshot, missing PHPStan, etc.).
- *
- * CATATAN KONFIGURASI (RCA OOM PHPStan 2026-09-12):
- *   Analisis PHPStan dijalankan memakai OVERLAY `phpstan-ci.neon` yang
- *   meng-import `phpstan.neon.dist` + membatasi parallel.maximumNumberOfProcesses
- *   (tanpa section itu, default = jumlah core -> agregat RSS ~1,4 GB menembus
- *   cgroup runner GitLab ~1 GB -> SIGKILL exit 137; terukur ulang: base 9 proses
- *   / 1393 MB vs overlay 3 proses / 528 MB). Bila overlay tidak ada (mis. repo
- *   kanonik belum memuatnya), jatuh kembali ke `phpstan.neon.dist` supaya tool
- *   tetap deterministik & tidak fail-closed hanya karena file tak ada.
- *   Overlay WAJIB ada di subtree mirror (OFFLOAD_PATHS) agar paritas terjaga.
  */
 
 $root = dirname(__DIR__);
 $failures = [];
 
-// ── Invariant 3: Snapshot floor must exist and be valid ──────────────────────
+// ── Invariant 3: Snapshot floor must exist and be valid ───────────────────────
 
 $snapshotPath = $root . '/phpstan-baseline-snapshot.json';
 if (!is_file($snapshotPath)) {
@@ -127,7 +117,7 @@ if ($currentEntries < $floorEntries) {
     echo "Debt reduction: {$reduced} entries burned since floor (good)\n";
 }
 
-// ── Invariant 1: PHPStan with baseline must yield zero unbaselined errors ───
+// ── Invariant 1: PHPStan with baseline must yield zero unbaselined errors ────
 
 $phpstan = $root . '/vendor/bin/phpstan';
 if (!is_file($phpstan)) {
@@ -135,15 +125,15 @@ if (!is_file($phpstan)) {
     exit(2);
 }
 
-// Prefer overlay CI (batas worker paralel -> bebas OOM cgroup). Fallback ke
-// konfigurasi kanonik bila overlay belum tersedia.
+// Prefer overlay CI (batas worker paralel -> bebas OOM cgroup; RCA 2026-09-12).
+// Fallback ke konfigurasi kanonik bila overlay belum tersedia.
 $ciOverlay = $root . '/phpstan-ci.neon';
 $config = is_file($ciOverlay) ? $ciOverlay : $root . '/phpstan.neon.dist';
 if (!is_file($config)) {
     fwrite(STDERR, "FAIL: PHPStan config not found: {$config}\n");
     exit(2);
 }
-echo "PHPStan config: " . basename($config) . "\n";
+echo 'PHPStan config: ' . basename($config) . "\n";
 
 $output = [];
 $rc = 0;
