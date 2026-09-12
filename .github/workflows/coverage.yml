@@ -23,6 +23,18 @@ name: zef-coverage
 on:
   push:
     branches: [main]
+  # Fase 7 (#31): trigger pull_request ditambahkan agar context check
+  # "PHPUnit + Xdebug branch coverage (2 vCPU / 7 GB)" BENAR-BENAR dihasilkan
+  # saat PR dibuka. Sebelumnya context itu hanya diproduksi oleh `push` ke
+  # `main`, sehingga required status check di ruleset 22945106 MUSTAHIL
+  # terpenuhi di PR mana pun -> satu-satunya jalur merge adalah bypass GitHub
+  # App. Dengan trigger ini, bypass tidak lagi wajib.
+  #   - `branches: ["main"]` : hindari membakar runner utk PR ke branch lain.
+  #   - `ready_for_review`   : PR draft tidak dieksekusi sampai siap review.
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Jalur manual untuk re-run / eksekusi lokal.
   workflow_dispatch:
 
 concurrency:
