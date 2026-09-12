@@ -110,6 +110,13 @@ const STAGE3C_VERDICT_SCHEMA = 'zef.coverage-gate.stage3c-verdict/v1';
 /** Gate D (#36): tingkat verdict jendela Tahap 3c. */
 const STAGE3C_QUALIFIED     = 'QUALIFIED';
 const STAGE3C_NOT_QUALIFIED = 'NOT_QUALIFIED';
+/**
+ * Gate F (#38) - Clean-Window Semantics: schema berkas qualification anchor
+ * (`docs/parity/qualification-anchor.json`). Anchor dapat DI-RESET ke commit perbaikan
+ * (mis. perbaikan determinisme artifact), sehingga commit sebelum perbaikan TIDAK PERNAH
+ * dicampur ke keranjang kualifikasi. Bila anchor tidak terdefinisi -> fail-closed.
+ */
+const STAGE3C_ANCHOR_SCHEMA = 'zef.coverage-gate.qualification-anchor/v1';
 
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
@@ -1283,6 +1290,7 @@ function computeStage3cVerdict(array $w): array
     $win     = is_array($w['window'] ?? null) ? $w['window'] : [];
     $ledger  = is_array($w['ledger'] ?? null) ? $w['ledger'] : [];
     $domains = is_array($w['domains'] ?? null) ? $w['domains'] : [];
+    $anchor  = is_array($w['anchor'] ?? null) ? $w['anchor'] : [];
 
     $minC = (int) ($w['min_commits'] ?? STAGE3C_MIN_COMMITS);
     $minD = (float) ($w['min_days'] ?? STAGE3C_MIN_DAYS);
@@ -1293,13 +1301,40 @@ function computeStage3cVerdict(array $w): array
         $minD = (float) STAGE3C_MIN_DAYS;
     }
 
-    $commits = is_numeric($win['commits_in_window'] ?? null) ? (int) $win['commits_in_window'] : count($ledger);
-    $daysRaw = $win['days_elapsed'] ?? null;
+    // -----------------------------------------------------------------------
+    // Gate F (#38) - CLEAN-WINDOW SEMANTICS.
+    //   qualification anchor = commit perbaikan terakhir (mis. perbaikan
+    //   determinisme artifact). Keranjang kualifikasi HANYA memuat commit/hari
+    //   SEJAK anchor: incident -> root cause fixed -> anchor DI-RESET -> 10
+    //   commit bersih ATAU 14 hari bersih -> QUALIFIED. Commit sebelum anchor
+    //   TIDAK PERNAH ikut dihitung.
+    //   FAIL-CLOSED: anchor tak terdefinisi TIDAK PERNAH menghasilkan QUALIFIED.
+    // -----------------------------------------------------------------------
+    $anchorSha     = trim((string) ($anchor['sha'] ?? ''));
+    $anchorAt      = trim((string) ($anchor['at'] ?? ''));
+    $anchorResetAt = trim((string) ($anchor['reset_at'] ?? ''));
+    $anchorReason  = trim((string) ($anchor['reason'] ?? ''));
+    $anchorDefined = (($anchor['defined'] ?? null) === true) || ($anchorSha !== '' && $anchorAt !== '');
+    if (!$anchorDefined) {
+        $notes[] = 'anchor-undefined';
+    } elseif ($anchorResetAt !== '') {
+        $notes[] = 'anchor-reset:' . $anchorResetAt;
+    }
+
+    // Angka bersih (sejak anchor). Bila observer tidak mengirim `clean_*`, jatuh ke angka
+    // window mentah - namun ketiadaan anchor tetap fail-closed, sehingga fallback ini
+    // tidak pernah bisa "menyelamatkan" window tanpa anchor.
+    $commits = is_numeric($win['clean_commits'] ?? null)
+        ? (int) $win['clean_commits']
+        : (is_numeric($win['commits_in_window'] ?? null) ? (int) $win['commits_in_window'] : count($ledger));
+    $daysRaw = $win['clean_days'] ?? ($win['days_elapsed'] ?? null);
     $daysUnmeasured = !is_numeric($daysRaw);
     $days = $daysUnmeasured ? 0.0 : (float) $daysRaw;
     if ($daysUnmeasured) {
         $notes[] = 'days-unmeasured';
     }
+    $rawCommits = is_numeric($win['commits_in_window'] ?? null) ? (int) $win['commits_in_window'] : $commits;
+    $rawDays    = is_numeric($win['days_elapsed'] ?? null) ? (float) $win['days_elapsed'] : null;
 
     // Syarat minimum window: >= 10 commit ATAU >= 14 hari (mana yang lebih dulu tercapai).
     $windowSatisfied = ($commits >= $minC) || ($days >= $minD);
@@ -1396,6 +1431,11 @@ function computeStage3cVerdict(array $w): array
         }
     }
 
+    // Gate F: anchor tak terdefinisi = fail-closed (tidak boleh QUALIFIED).
+    if (!$anchorDefined) {
+        $reasons[] = 'anchor-undefined';
+    }
+
     $qualified = $reasons === [];
 
     return [
@@ -1404,9 +1444,32 @@ function computeStage3cVerdict(array $w): array
         'window_satisfied' => $windowSatisfied,
         'reasons' => $reasons,
         'notes' => $notes,
+        // Gate F (#38) - penanda HOLD eksplisit. Hardening Gate E DITAHAN sampai
+        // clean window terpenuhi; Stage 4 tetap HOLD; cutover canonical BELUM disetujui.
+        'hold' => [
+            'gate_e' => 'HELD',
+            'stage4' => 'HOLD',
+            'canonical_cutover' => 'NOT_APPROVED',
+            'held_until' => 'clean-window-qualified',
+        ],
+        'anchor' => [
+            'defined' => $anchorDefined,
+            'sha' => $anchorSha,
+            'at' => $anchorAt,
+            'reset_at' => $anchorResetAt,
+            'reason' => $anchorReason,
+        ],
         'metrics' => [
             'commits_in_window' => $commits,
             'days_elapsed' => $daysUnmeasured ? null : $days,
+            'clean_commits' => $commits,
+            'clean_days' => $daysUnmeasured ? null : $days,
+            'raw_commits' => $rawCommits,
+            'raw_days' => $rawDays,
+            'anchor_defined' => $anchorDefined,
+            'anchor_sha' => $anchorSha,
+            'anchor_at' => $anchorAt,
+            'anchor_reset_at' => $anchorResetAt,
             'min_commits' => $minC,
             'min_days' => $minD,
             'ledger_total' => count($ledger),
@@ -1414,6 +1477,8 @@ function computeStage3cVerdict(array $w): array
             'hard_violations' => count($violations),
             'violation_refs' => array_slice($violations, 0, 10),
             'consecutive_failures' => $consec,
+            'gate_e_hold' => 'HELD',
+            'stage4_hold' => 'HOLD',
             'domains' => [
                 'execution_parity' => $dv('execution_parity'),
                 'operational_resilience' => $dv('operational_resilience'),
@@ -1486,12 +1551,35 @@ function stage3cMode(string $file, string $outDir, bool $compact = false, bool $
             (string) $m['domains']['merge_control'],
             (string) $m['domains']['canonical_ownership']
         );
+        // Gate F (#38) - clean-window semantics: angka BERSIH sejak qualification anchor,
+        // dibedakan tegas dari angka window mentah (yang masih memuat commit pra-perbaikan).
+        printf(
+            "  clean-window: commit_bersih=%d hari_bersih=%s (window_mentah: commit=%d hari=%s)\n",
+            (int) $m['clean_commits'],
+            $m['clean_days'] === null ? 'n/a' : number_format((float) $m['clean_days'], 4),
+            (int) $m['raw_commits'],
+            $m['raw_days'] === null ? 'n/a' : number_format((float) $m['raw_days'], 4)
+        );
+        printf(
+            "  anchor      : defined=%s sha=%s reset_at=%s\n",
+            $m['anchor_defined'] ? 'ya' : 'TIDAK',
+            (string) ($m['anchor_sha'] === '' ? 'n/a' : $m['anchor_sha']),
+            (string) ($m['anchor_reset_at'] === '' ? 'n/a' : $m['anchor_reset_at'])
+        );
         foreach ($v['notes'] as $n) {
             echo '  catatan     : ' . (string) $n . "\n";
         }
         foreach ($v['reasons'] as $r) {
             echo '  penghambat  : ' . (string) $r . "\n";
         }
+        // Gate F: penanda HOLD eksplisit - terlihat di TRACE, bukan hanya di dokumen.
+        printf(
+            "  hold        : gate_e=%s stage4=%s canonical_cutover=%s sampai=%s\n",
+            (string) $v['hold']['gate_e'],
+            (string) $v['hold']['stage4'],
+            (string) $v['hold']['canonical_cutover'],
+            (string) $v['hold']['held_until']
+        );
         echo '== STAGE 3C: ' . (string) $v['verdict'] . " ==\n";
     }
 
@@ -1507,6 +1595,8 @@ function stage3cMode(string $file, string $outDir, bool $compact = false, bool $
             'window_satisfied' => $v['window_satisfied'],
             'reasons' => $v['reasons'],
             'notes' => $v['notes'],
+            'anchor' => $v['anchor'],
+            'hold' => $v['hold'],
             'metrics' => $m,
         ];
         $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
@@ -2624,6 +2714,8 @@ function selftest(): int
             'schema' => STAGE3C_WINDOW_SCHEMA,
             'min_commits' => 10,
             'min_days' => 14,
+            'anchor' => ['defined' => true, 'sha' => str_repeat('f', 40),
+                'at' => '2026-09-12T22:29:00+00:00', 'reset_at' => '2026-09-12T22:29:00+00:00'],
             'window' => ['commits_in_window' => $rows, 'days_elapsed' => 3.0],
             'domains' => $domDN,
             'hard_violations' => [],
@@ -2689,6 +2781,53 @@ function selftest(): int
     $s3nc = computeStage3cVerdict($mkWin(['window' => ['commits_in_window' => 12, 'days_elapsed' => null]], 12));
     $ok('GateD hari tak terukur tapi commit>=min -> tetap QUALIFIED (jalur commit)',
         $s3nc['verdict'] === STAGE3C_QUALIFIED && $s3nc['window_satisfied'] === true);
+
+    // -----------------------------------------------------------------------
+    // Gate F (#38) - CLEAN-WINDOW SEMANTICS + qualification anchor.
+    //   incident -> root cause fixed -> anchor DI-RESET -> 10 commit bersih
+    //   ATAU 14 hari bersih -> QUALIFIED. Commit sebelum anchor tidak pernah
+    //   dicampur ke keranjang kualifikasi; anchor tak terdefinisi = fail-closed.
+    // -----------------------------------------------------------------------
+    $anchorOk = ['defined' => true, 'sha' => str_repeat('f', 40), 'at' => '2026-09-12T22:29:00+00:00', 'reset_at' => '2026-09-12T22:29:00+00:00'];
+    // (a) anchor terdefinisi + window bersih -> QUALIFIED, anchor terbawa ke metrics.
+    $fOk = computeStage3cVerdict($mkWin(['anchor' => $anchorOk]));
+    $ok('GateF anchor terdefinisi + window bersih -> QUALIFIED',
+        $fOk['verdict'] === STAGE3C_QUALIFIED && $fOk['anchor']['defined'] === true);
+    $ok('GateF anchor sha/reset_at terekam di metrics',
+        $fOk['metrics']['anchor_sha'] === str_repeat('f', 40)
+        && $fOk['metrics']['anchor_reset_at'] === '2026-09-12T22:29:00+00:00');
+    $ok('GateF clean_commits == commits_in_window saat observer tak kirim clean_*',
+        (int) $fOk['metrics']['clean_commits'] === (int) $fOk['metrics']['commits_in_window']);
+    // (b) anchor TAK terdefinisi -> fail-closed: NOT_QUALIFIED walau window mentah penuh.
+    $fUndef = computeStage3cVerdict($mkWin(['anchor' => ['defined' => false, 'sha' => '', 'at' => '', 'reset_at' => '']]));
+    $ok('GateF anchor tak terdefinisi -> NOT_QUALIFIED (fail-closed)',
+        $fUndef['verdict'] === STAGE3C_NOT_QUALIFIED
+        && in_array('anchor-undefined', $fUndef['reasons'], true)
+        && $fUndef['anchor']['defined'] === false);
+    $ok('GateF anchor tak terdefinisi -> catatan anchor-undefined', in_array('anchor-undefined', $fUndef['notes'], true));
+    // Bahkan window mentah 12 commit / 14,2 hari TIDAK boleh menyelamatkan tanpa anchor.
+    $fUndef2 = computeStage3cVerdict($mkWin(['anchor' => ['defined' => false, 'sha' => '', 'at' => ''],
+        'window' => ['commits_in_window' => 12, 'days_elapsed' => 14.2]], 12));
+    $ok('GateF window mentah penuh tanpa anchor -> tetap NOT_QUALIFIED',
+        $fUndef2['verdict'] === STAGE3C_NOT_QUALIFIED && $fUndef2['window_satisfied'] === true);
+    // (c) anchor DI-RESET ke SHA lebih baru: commit sebelum anchor DIKELUARKAN dari hitungan bersih.
+    //     window mentah = 12 commit, tetapi hanya 4 yang bersih sejak reset -> NOT_QUALIFIED.
+    $fReset = computeStage3cVerdict($mkWin([
+        'anchor' => ['defined' => true, 'sha' => str_repeat('f', 40), 'at' => '2026-09-12T22:29:00+00:00',
+            'reset_at' => '2026-09-12T22:29:00+00:00', 'reason' => 'root cause fixed'],
+        'window' => ['commits_in_window' => 12, 'days_elapsed' => 3.0, 'clean_commits' => 4, 'clean_days' => 3.0],
+    ], 12));
+    $ok('GateF reset anchor -> commit pra-anchor dikecualikan (raw=12, bersih=4)',
+        (int) $fReset['metrics']['raw_commits'] === 12 && (int) $fReset['metrics']['clean_commits'] === 4);
+    $ok('GateF reset anchor -> NOT_QUALIFIED karena bersih < minimum',
+        $fReset['verdict'] === STAGE3C_NOT_QUALIFIED
+        && in_array('window-belum-minimum:4commit/3.00hari (butuh >= 10 commit ATAU >= 14 hari)', $fReset['reasons'], true));
+    $ok('GateF reset anchor -> catatan anchor-reset terlihat', in_array('anchor-reset:2026-09-12T22:29:00+00:00', $fReset['notes'], true));
+    // (d) penanda HOLD eksplisit selalu terbawa (Gate E ditahan, Stage 4 HOLD, cutover belum disetujui).
+    $ok('GateF hold: gate_e=HELD', (string) $fOk['hold']['gate_e'] === 'HELD');
+    $ok('GateF hold: stage4=HOLD', (string) $fOk['hold']['stage4'] === 'HOLD');
+    $ok('GateF hold: canonical_cutover=NOT_APPROVED', (string) $fOk['hold']['canonical_cutover'] === 'NOT_APPROVED');
+    $ok('GateF hold terbawa juga saat NOT_QUALIFIED', (string) $fReset['hold']['stage4'] === 'HOLD');
 
     // -----------------------------------------------------------------------
     // Gate E (#37) - klasifikasi KETERLIHATAN bypass (read-only; TIDAK mengubah
