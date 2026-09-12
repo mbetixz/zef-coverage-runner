@@ -16,15 +16,16 @@
 #     "Child process error (exit code 137): Killed while running parallel
 #     worker" -> exit 1.
 #   - Runner GitHub 7 GB memberi headroom ~5x terhadap agregat 1,4 GB.
+#   - Perbaikan P0 sebenarnya: overlay `phpstan-ci.neon` membatasi worker
+#     paralel ke 2 -> agregat ~528 MB (3 proses), terukur aman di cgroup ~1 GB
+#     MAUPUN 3,5 GB. File kanonik phpstan.neon.dist TIDAK diubah.
 #
 # PARITAS dengan job phpstan lama di .gitlab-ci.yml zeflous/zef:
 #   - PHP 8.4 + Composer 2.10.3 (pin) + composer install dari composer.lock
-#   - composer validate --strict --no-check-publish --no-check-version
-#     (paritas 1:1 dgn job composer-validate GitLab; --no-check-version WAJIB
-#     karena marker versi internal repo "v250B1" bukan semver)
-#   - vendor/bin/phpstan analyse --configuration phpstan.neon.dist --no-progress
+#   - vendor/bin/phpstan analyse --configuration=phpstan-ci.neon --no-progress
 #     --error-format=gitlab  -> var/phpstan/phpstan-report.json
-#     (format gitlab = Code Quality JSON, kompatibel dgn artifact lama)
+#     (overlay meng-import phpstan.neon.dist; format gitlab = Code Quality JSON,
+#      kompatibel dgn artifact lama)
 #   - invariant baseline: php tools/verify-baseline-drift.php (0 debt baru)
 #   - artifact var/phpstan/ di-upload `if: always()` (bukti walau gagal)
 #
@@ -54,8 +55,8 @@ permissions:
 env:
   COMPOSER_CACHE_DIR: ${{ github.workspace }}/.composer-cache
   # Runner standard GitHub = 2 vCPU / 7 GB RAM. Heap PHP per-proses 6144M
-  # menyisakan ruang utk OS; agregat terukur ~1,4 GB -> aman (bandingkan
-  # runner GitLab ~1 GB yang OOM/exit 137).
+  # menyisakan ruang utk OS; agregat terukur (2 worker) ~528 MB -> aman
+  # (bandingkan runner GitLab ~1 GB yang OOM/exit 137).
   PHP_MEMORY_LIMIT: "6144M"
 
 jobs:
@@ -66,6 +67,24 @@ jobs:
     steps:
       - name: Checkout mirror
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned: supply-chain policy FU-3)
+
+      # GUARD FAST-FAIL: mirror yang tidak lengkap (mis. push di-skip karena
+      # token tidak tersedia di pipeline MR) HARUS gagal di sini, bukan lolos
+      # sampai PHPStan error yang menyesatkan. Empat file ini WAJIB ada:
+      #   phpstan.neon.dist  -> konfigurasi kanonik
+      #   phpstan-ci.neon    -> overlay batas worker paralel (RCA OOM)
+      #   index.php / quality-gate.php -> ada di `paths` phpstan.neon.dist
+      - name: Guard — berkas wajib mirror ada
+        run: |
+          missing=0
+          for f in phpstan.neon.dist phpstan-ci.neon index.php quality-gate.php; do
+            if [ ! -f "$f" ]; then echo "::error::berkas wajib tidak ada di mirror: $f"; missing=1; fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Mirror tidak lengkap — push dari phpstan-offload kemungkinan di-skip (token tidak tersedia pada ref pipeline ini)."
+            exit 1
+          fi
+          echo "Guard OK: phpstan.neon.dist, phpstan-ci.neon, index.php, quality-gate.php ada."
 
       - name: Cache Composer
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 (pinned: supply-chain policy FU-3)
@@ -104,15 +123,29 @@ jobs:
       - name: composer install (from lock)
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
 
-      - name: PHPStan level max (report gitlab JSON)
+      - name: PHPStan level max (report gitlab JSON) + audit worker/RSS
         run: |
           set -o pipefail
           mkdir -p var/phpstan
+          echo "== audit: paralel yang berlaku (overlay phpstan-ci.neon) =="
+          php vendor/bin/phpstan dump-parameters --configuration=phpstan-ci.neon \
+            | awk '/^parallel:/{f=1} f && /maximumNumberOfProcesses/{sub(/^ */,"",$0); print "  "$0; exit}'
           php -d memory_limit="${PHP_MEMORY_LIMIT}" vendor/bin/phpstan analyse \
-            --configuration phpstan.neon.dist \
+            --configuration=phpstan-ci.neon \
             --no-progress \
             --error-format=gitlab \
-            > var/phpstan/phpstan-report.json
+            > var/phpstan/phpstan-report.json &
+          PHPSTAN_PID=$!
+          PEAK=0; MAXP=0
+          while kill -0 "$PHPSTAN_PID" 2>/dev/null; do
+            read -r tot cnt <<<"$(ps -eo rss,comm --no-headers 2>/dev/null | awk '$2 ~ /php/ {s+=$1;c++} END {printf "%d %d", s+0, c+0}')"
+            [ "${tot:-0}" -gt "$PEAK" ] && PEAK=$tot
+            [ "${cnt:-0}" -gt "$MAXP" ] && MAXP=$cnt
+            sleep 0.2
+          done
+          wait "$PHPSTAN_PID"; rc=$?
+          echo "== audit: puncak RSS agregat = $((PEAK/1024)) MB | proses php puncak = $MAXP | exit=$rc =="
+          exit "$rc"
 
       - name: PHPStan baseline invariant (0 unbaselined errors)
         run: php tools/verify-baseline-drift.php
