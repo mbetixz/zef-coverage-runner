@@ -108,6 +108,13 @@ $compact   = (bool) $opt('compact', false);
 // --strict-numeric: naikkan dimensi numerik yang belum terukur (n/a) menjadi ERROR.
 // Default OFF agar gate tetap hijau selama job `coverage` GitLab belum kembali (Tahap 3c).
 $strictNumeric = (bool) $opt('strict-numeric', false);
+// --evidence-authoritative: OBSERVER sudah memverifikasi EVIDENCE CONTRACT bersama (#32).
+//   Di arsitektur offload, status kanonik GitLab bersifat KORROBORASI - bukan penentu
+//   PASS/FAIL (penentu = contract yang diverifikasi di langkah [3/7] observer). Karena itu
+//   riwayat status GitLab yang tipis/terpotong tidak boleh menurunkan verdict baris.
+//   TANPA flag ini perilaku lama (fail-closed) TETAP berlaku, sehingga guard Qodo #12
+//   tidak hilang - ia hanya tidak diberlakukan saat contract sudah otoritatif.
+$evidenceAuthoritative = (bool) $opt('evidence-authoritative', false);
 $baseline = (string) $opt('baseline', '');
 
 $POLICY['line_tol']    = (float) $opt('line-tol', $POLICY['line_tol']);
@@ -690,14 +697,23 @@ function classifyRowResult(
     string $glState,
     string $glStatusFetch,
     string $offloadState,
-    array $numNA
+    array $numNA,
+    bool $evidenceAuthoritative = false
 ): array {
     // 1. Vakum: commit tanpa dual-run (pipeline tak mencapai offload).
     if (($conclusion === '' || $glState === '') && $offloadState !== 'success') {
         return ['N/A(no-dual-run:' . $offloadState . ')', false, true];
     }
-    // 2. Riwayat status terpotong — MENDAHULUI mismatch (koreksi Qodo #12).
+    // 2. Riwayat status terpotong - MENDAHULUI mismatch (koreksi Qodo #12).
+    //    #32: bila observer SUDAH memverifikasi evidence contract bersama, verdict baris
+    //    bersumber dari contract itu dan paritas status GitLab hanya korroborasi. Dalam rezim
+    //    itu riwayat yang terpotong DILAPORKAN eksplisit sebagai n/a(gl_status_partial) -
+    //    bukan pelanggaran DAN bukan lulus diam-diam. Tanpa --evidence-authoritative,
+    //    perilaku fail-closed lama dipertahankan utuh.
     if ($glStatusFetch === 'partial') {
+        if ($evidenceAuthoritative) {
+            return ['n/a(gl_status_partial)', false, false];
+        }
         return ['INCOMPLETE(gl_status_partial)', true, false];
     }
     // 3. Pelanggaran kebijakan.
@@ -1268,7 +1284,8 @@ foreach ($commits as $idx => $c) {
         $glState,
         (string) ($row['gl_status_fetch'] ?? 'complete'),
         $offloadState,
-        $numNA
+        $numNA,
+        $evidenceAuthoritative
     );
     $row['result'] = $rowResult;
     if ($rowIsVacuous) {
