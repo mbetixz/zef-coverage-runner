@@ -1,0 +1,9 @@
+{
+    "snapshot_version": 1,
+    "milestone": "R",
+    "captured_at": "2025-01-01T00:00:00Z",
+    "baseline_file": "phpstan-baseline.neon",
+    "entries": 286,
+    "errors": 347,
+    "comment": "R baseline floor. This is the maximum allowed baseline size. Per Non-Negotiable Rule #7, the baseline may not grow beyond this floor. Each remediation batch must reduce debt. verify-baseline-drift.php enforces this invariant."
+}

@@ -1,0 +1,39 @@
+# ------------------------------------------------------------
+# phpstan-ci.neon — OVERLAY KHUSUS CI (perbaikan P0 RCA OOM PHPStan).
+#
+# MENGAPA file ini ada (dan MENGAPA `phpstan.neon.dist` kanonik TIDAK diubah):
+#
+#   `phpstan.neon.dist` TIDAK memuat section `parallel`, sehingga PHPStan
+#   memakai default `maximumNumberOfProcesses` = jumlah core. Pengukuran
+#   ulang (RCA phpstan OOM) menunjukkan puncak RSS AGREGAT ~1.408 MB dengan
+#   17 proses PHP paralel (puncak satu proses 186 MB). Karena `memory_limit`
+#   PHP bersifat PER-PROSES, menaikkan PHP_MEMORY_LIMIT TIDAK membatasi
+#   agregat: pada cgroup runner GitLab (~1 GB) agregat menembus batas ->
+#   kernel SIGKILL -> PHPStan melaporkan
+#   "Child process error (exit code 137): Killed while running parallel worker"
+#   -> job gagal (intermiten ~28%, juga terjadi di `main`).
+#
+#   Overlay ini MENGIMPOR konfigurasi kanonik apa adanya (level max, paths,
+#   baseline, tmpDir, bootstrapFiles, excludePaths — semuanya diwarisi) dan
+#   HANYA menambahkan batas jumlah worker paralel. Dengan 2 worker, agregat
+#   ≈ 2 x 186 MB ≈ 372 MB — aman di bawah cgroup ~1 GB maupun ~3,5 GB,
+#   sehingga OOM tidak lagi mungkin dari sisi jumlah proses.
+#
+# CATATAN PARITAS: file ini diletakkan di ROOT repo (sejajar dengan
+# `phpstan.neon.dist`) supaya SEMUA path relatif di konfigurasi kanonik
+# (`paths`, `tmpDir: var/phpstan`, `bootstrapFiles: src/autoload.php`,
+# `excludePaths`) tetap resolve ke lokasi yang sama seperti sebelumnya.
+#
+# Dipakai oleh: job GitLab `phpstan` (.gitlab-ci.yml) dan step PHPStan di
+# `.github/workflows/phpstan.yml`.
+# ------------------------------------------------------------
+
+includes:
+    - phpstan.neon.dist
+
+parameters:
+    # RCA phpstan OOM: batasi worker paralel -> agregat memori terikat.
+    # 2 (bukan 1) mempertahankan paralelisme dasar sekaligus memberi margin
+    # besar terhadap batas cgroup runner.
+    parallel:
+        maximumNumberOfProcesses: 2
