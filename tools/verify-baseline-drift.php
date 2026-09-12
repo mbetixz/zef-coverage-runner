@@ -125,16 +125,30 @@ if (!is_file($phpstan)) {
     exit(2);
 }
 
-$config = $root . '/phpstan.neon.dist';
+// Prefer overlay CI (batas worker paralel -> bebas OOM cgroup; RCA 2026-09-12).
+// Fallback ke konfigurasi kanonik bila overlay belum tersedia.
+$ciOverlay = $root . '/phpstan-ci.neon';
+$config = is_file($ciOverlay) ? $ciOverlay : $root . '/phpstan.neon.dist';
 if (!is_file($config)) {
     fwrite(STDERR, "FAIL: PHPStan config not found: {$config}\n");
     exit(2);
 }
+echo 'PHPStan config: ' . basename($config) . "\n";
 
 $output = [];
 $rc = 0;
+// RCA OOM (2026-09-12) — lapis kedua. Job `baseline-drift` sebelumnya memanggil
+// PHPStan dengan `PHP_BINARY` polos sehingga memory_limit default image (128M)
+// berlaku: PHPStan worker mati "reached configured PHP memory limit: 128M"
+// -> job merah walau jumlah worker sudah dibatasi overlay. Hormati
+// PHP_MEMORY_LIMIT dari environment bila ada (default tetap 1G).
+$memLimit = getenv('PHP_MEMORY_LIMIT');
+if ($memLimit === false || trim((string) $memLimit) === '') {
+    $memLimit = '1024M';
+}
 exec(
-    PHP_BINARY . ' ' . escapeshellarg($phpstan)
+    PHP_BINARY . ' -d memory_limit=' . escapeshellarg($memLimit)
+    . ' ' . escapeshellarg($phpstan)
     . ' analyse --configuration=' . escapeshellarg($config)
     . ' --no-progress --error-format=raw 2>&1',
     $output,
