@@ -7,10 +7,10 @@ namespace {
     use PHPUnit\Framework\TestCase;
 
     /**
-     * Bukti + gate kebijakan penyimpanan rahasia (#12, 2026-09-12).
+     * Bukti + gate kebijakan penimpanan rahasia (#12, 2026-09-12).
      *
      * Kebijakan pemilik akun: token sensitif HANYA hidup sebagai GitLab CI/CD
-     * variable (Protected + Masked). Berkas di sandbox/repo TIDAK BOLEH
+     * variable (Protected + Masked). Berkas di sandbox/repo TIDAK BOLEH 
      * menyimpan nilai rahasia; skrip WAJIB membaca dari environment dan
      * gagal-closed bila tidak tersedia.
      *
@@ -30,6 +30,26 @@ namespace {
         private static function repoRoot(): string
         {
             return \dirname(__DIR__, 2);
+        }
+
+        /**
+         * Policy gate #12 only applies to the CANONICAL checkout (zeflous/zef).
+         * The public mirror (mbetixz/zef-coverage-runner) receives only the
+         * OFFLOAD_PATHS whitelist (composer.json, composer.lock, phpunit.xml.dist,
+         * src/, tests/, tools/); scripts/, .gitignore and .gitlab-ci.yml are
+         * intentionally absent there, so the references below cannot resolve and
+         * the coverage gate went falsely red (GitHub runs 34657623631/34661434219).
+         *
+         * Discriminator: .gitlab-ci.yml exists in the canonical repo and never in
+         * the mirror, so the guard stays fully armed on the source (e.g. deleting
+         * scripts/require-ci-secret.sh still makes test 1 FAIL, not skip).
+         */
+        #[\Override]
+        protected function setUp(): void
+        {
+            if (!is_file(self::repoRoot() . '/.gitlab-ci.yml')) {
+                self::markTestSkipped('not a canonical checkout (coverage mirror without .gitlab-ci.yml)');
+            }
         }
 
         public function testRequireCiSecretGuardExistsAndIsExecutable(): void
