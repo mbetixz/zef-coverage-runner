@@ -1,0 +1,129 @@
+# ZEF Framework — PHPStan gate (GitHub Actions)
+#
+# Fase lanjut blueprint "GitLab -> GitHub Runner Cluster" (Opsi 3 RCA phpstan
+# OOM). PHPStan level max DIEKSEKUSI PENUH di GitHub-hosted runner
+# (2 vCPU / 7 GB, gratis utk repo public) sebagai KOMPLEMEN runner GitLab yang
+# OOM (exit 137) saat analisis paralel.
+#
+# AKAR MASALAH yang diselesaikan (RCA zef-phpstan-oom):
+#   - phpstan.neon.dist TIDAK memuat section `parallel`, sehingga PHPStan
+#     memakai default maximumNumberOfProcesses = jumlah core.
+#   - Pengukuran ulang lokal: puncak RSS AGREGAT ~1.408 MB (~1,4 GB) dengan
+#     17 proses PHP paralel; puncak satu proses 186 MB.
+#   - `memory_limit` PHP bersifat PER-PROSES -> menaikkan PHP_MEMORY_LIMIT
+#     TIDAK membatasi agregat. Pada cgroup runner GitLab ~1 GB, agregat
+#     menembus batas -> kernel SIGKILL -> PHPStan melaporkan
+#     "Child process error (exit code 137): Killed while running parallel
+#     worker" -> exit 1.
+#   - Runner GitHub 7 GB memberi headroom ~5x terhadap agregat 1,4 GB.
+#
+# PARITAS dengan job phpstan lama di .gitlab-ci.yml zeflous/zef:
+#   - PHP 8.4 + Composer 2.10.3 (pin) + composer install dari composer.lock
+#   - vendor/bin/phpstan analyse --configuration phpstan.neon.dist --no-progress
+#     --error-format=gitlab  -> var/phpstan/phpstan-report.json
+#     (format gitlab = Code Quality JSON, kompatibel dgn artifact lama)
+#   - invariant baseline: php tools/verify-baseline-drift.php (0 debt baru)
+#   - artifact var/phpstan/ di-upload `if: always()` (bukti walau gagal)
+#
+# KEBIJAKAN SUPPLY-CHAIN FU-3: SEMUA `uses:` dipin ke commit SHA penuh.
+#
+# Tidak ada secret GitLab di repo ini; hanya source/test/config (mirror
+# publik tanpa artefak kanonik). Source repo canonical tetaplah zeflous/zef.
+
+name: zef-phpstan
+
+on:
+  # Branch terdedikasi: di-push oleh job GitLab `phpstan-offload`.
+  # Push (bukan workflow_dispatch) dipakai supaya deterministik dan tidak
+  # bergantung pada izin `actions: write` milik token otomasi.
+  push:
+    branches: ["ci/phpstan-offload-github"]
+  # Jalur manual untuk re-run / eksekusi lokal.
+  workflow_dispatch:
+
+concurrency:
+  group: phpstan-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  COMPOSER_CACHE_DIR: ${{ github.workspace }}/.composer-cache
+  # Runner standard GitHub = 2 vCPU / 7 GB RAM. Heap PHP per-proses 6144M
+  # menyisakan ruang utk OS; agregat terukur ~1,4 GB -> aman (bandingkan
+  # runner GitLab ~1 GB yang OOM/exit 137).
+  PHP_MEMORY_LIMIT: "6144M"
+
+jobs:
+  phpstan:
+    name: PHPStan level max (GitHub 2 vCPU / 7 GB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned: supply-chain policy FU-3)
+
+      - name: Cache Composer
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 (pinned: supply-chain policy FU-3)
+        with:
+          path: |
+            vendor/
+            .composer-cache/
+          key: composer-phpstan-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-phpstan-${{ runner.os }}-
+
+      - name: Setup PHP 8.4
+        # setup-php >= 2.37.1: fixes GHSA-5wxr-w449-57cm (Medium).
+        # coverage: none -> setup-php TIDAK menyentuh driver coverage.
+        uses: shivammathur/setup-php@7c071dfe9dc99bdf297fa79cb49ea005b9fcadbc # v2.37.1 (GHSA-5wxr-w449-57cm fixed)
+        with:
+          php-version: '8.4'
+          extensions: mbstring, xml, curl, zip
+          tools: composer:2.10.3
+          coverage: none
+
+      - name: Declare toolchain
+        run: |
+          php --version
+          composer --version
+
+      - name: composer validate
+        run: composer validate --strict --no-check-publish
+
+      - name: composer install (from lock)
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts
+
+      - name: PHPStan level max (report gitlab JSON)
+        run: |
+          set -o pipefail
+          mkdir -p var/phpstan
+          php -d memory_limit="${PHP_MEMORY_LIMIT}" vendor/bin/phpstan analyse \
+            --configuration phpstan.neon.dist \
+            --no-progress \
+            --error-format=gitlab \
+            > var/phpstan/phpstan-report.json
+
+      - name: PHPStan baseline invariant (0 unbaselined errors)
+        run: php tools/verify-baseline-drift.php
+
+      - name: Ringkasan report
+        if: always()
+        run: |
+          f=var/phpstan/phpstan-report.json
+          if [ -s "$f" ]; then
+            echo "phpstan-report.json: $(wc -c < "$f") bytes"
+            php -r '$d=json_decode((string) file_get_contents($argv[1]), true); printf("entri report: %d\n", is_array($d) ? count($d) : 0);' "$f" || true
+          else
+            echo "WARN: phpstan-report.json kosong / tidak ada"
+          fi
+
+      - name: Upload phpstan report (always)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 (pinned: supply-chain policy FU-3)
+        with:
+          name: zef-phpstan-report
+          path: var/phpstan/
+          if-no-files-found: warn
+          retention-days: 7
