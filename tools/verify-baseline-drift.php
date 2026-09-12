@@ -35,7 +35,7 @@ declare(strict_types=1);
 $root = dirname(__DIR__);
 $failures = [];
 
-// ── Invariant 3: Snapshot floor must exist and be valid ───────────────────────
+// ── Invariant 3: Snapshot floor must exist and be valid ──────────────────────
 
 $snapshotPath = $root . '/phpstan-baseline-snapshot.json';
 if (!is_file($snapshotPath)) {
@@ -117,7 +117,7 @@ if ($currentEntries < $floorEntries) {
     echo "Debt reduction: {$reduced} entries burned since floor (good)\n";
 }
 
-// ── Invariant 1: PHPStan with baseline must yield zero unbaselined errors ────
+// ── Invariant 1: PHPStan with baseline must yield zero unbaselined errors ───
 
 $phpstan = $root . '/vendor/bin/phpstan';
 if (!is_file($phpstan)) {
