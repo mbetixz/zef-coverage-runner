@@ -91,6 +91,26 @@ const DOMAIN_QUALIFIED = 'QUALIFIED';
 const DOMAIN_PARTIAL   = 'PARTIAL';
 const DOMAIN_FAIL      = 'FAIL';
 
+/**
+ * Gate D (#36) - jendela formal Tahap 3c.
+ *
+ * Definisi TERTULIS ada di docs/CANONICAL_MIGRATION_PLAN.md paragraf "Tahap 3c" (sumber
+ * otoritatif) dan disalin operasional di docs/GATE_D_STAGE3C_WINDOW.md. Konstanta di bawah
+ * hanyalah DEFAULT yang dapat dioverride lewat window JSON, sehingga kriteria tetap dapat
+ * diaudit tanpa membaca kode.
+ *   - Syarat minimum window: >= STAGE3C_MIN_COMMITS commit ATAU >= STAGE3C_MIN_DAYS hari
+ *     kalender, mana yang lebih dulu tercapai.
+ */
+const STAGE3C_MIN_COMMITS = 10;
+const STAGE3C_MIN_DAYS    = 14;
+/** Gate D (#36): schema window JSON yang dibangun observer dan dikonsumsi `--stage3c-window`. */
+const STAGE3C_WINDOW_SCHEMA  = 'zef.coverage-gate.stage3c-window/v1';
+/** Gate D (#36): schema keluaran verdict jendela Tahap 3c. */
+const STAGE3C_VERDICT_SCHEMA = 'zef.coverage-gate.stage3c-verdict/v1';
+/** Gate D (#36): tingkat verdict jendela Tahap 3c. */
+const STAGE3C_QUALIFIED     = 'QUALIFIED';
+const STAGE3C_NOT_QUALIFIED = 'NOT_QUALIFIED';
+
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
     'line_tol'     => 0.0,
@@ -130,6 +150,19 @@ if (is_string($opt('audit-evidence')) && $opt('audit-evidence') !== '') {
         (string) $opt('audit-evidence'),
         (string) $opt('out-dir', '/tmp/parity'),
         (bool) $opt('compact', false)
+    ));
+}
+
+// GATE D (#36): mode jendela formal Tahap 3c (tanpa jaringan - murni aritmetika verdict).
+// Observer `coverage-gate-audit` membangun window JSON dari LEDGER OBSERVER yang durable
+// (riwayat pipeline `source=schedule` + job `coverage-gate-audit`), lalu mode ini menghitung
+// status Stage 3c secara fail-closed. Ketiadaan pengukuran TIDAK PERNAH menghasilkan QUALIFIED.
+if (is_string($opt('stage3c-window')) && $opt('stage3c-window') !== '') {
+    exit(stage3cMode(
+        (string) $opt('stage3c-window'),
+        (string) $opt('out-dir', '/tmp/parity'),
+        (bool) $opt('compact', false),
+        (bool) $opt('stage3c-strict', false)
     ));
 }
 
@@ -1189,6 +1222,275 @@ function auditEvidenceMode(string $file, string $outDir, bool $compact = false):
         return EXIT_VIOLATION;
     }
     echo '== EVIDENCE CONTRACT v2: ' . (string) $domains['overall']['verdict'] . " ==\n";
+    return EXIT_PASS;
+}
+
+/**
+ * Gate D (#36) - verdict jendela formal Tahap 3c (fungsi MURNI - diuji langsung --selftest).
+ *
+ * Definisi formal (docs/CANONICAL_MIGRATION_PLAN.md, "Tahap 3c"; ringkasan operasional di
+ * docs/GATE_D_STAGE3C_WINDOW.md):
+ *   WINDOW   : sampel commit ke `main` yang diaudit observer.
+ *              - titik AWAL  = waktu pipeline observer pada commit ratifikasi (anchor).
+ *              - titik AKHIR = saat audit berjalan.
+ *              - syarat MINIMUM: >= 10 commit ATAU >= 14 hari kalender, mana yang lebih dulu.
+ *   XC(a)    : 0 pelanggaran kriteria keras (P1-P10, P12) di seluruh sampel.
+ *   XC(b)    : tidak terjadi 3 kegagalan beruntun.
+ *   XC(c)    : laporan paritas per-commit ADA untuk tiap commit sampel (ledger lengkap).
+ *   DOMAIN   : execution_parity TIDAK boleh FAIL; operational_resilience wajib QUALIFIED;
+ *              merge_control TIDAK boleh FAIL; canonical_ownership wajib QUALIFIED.
+ *
+ * FAIL-CLOSED: ketiadaan pengukuran TIDAK PERNAH menghasilkan QUALIFIED. Bila `days_elapsed`
+ * tak terukur, ia diperlakukan 0 (bukan tak terbatas), sehingga hanya jalur commit yang dapat
+ * memenuhi window - dan ketiadaan hari itu tetap DICATAT sebagai catatan eksplisit.
+ *
+ * @param array<string,mixed> $w window JSON (schema STAGE3C_WINDOW_SCHEMA)
+ * @return array{verdict:string,qualified:bool,window_satisfied:bool,reasons:array<int,string>,notes:array<int,string>,metrics:array<string,mixed>}
+ */
+function computeStage3cVerdict(array $w): array
+{
+    $reasons = [];
+    $notes   = [];
+    $win     = is_array($w['window'] ?? null) ? $w['window'] : [];
+    $ledger  = is_array($w['ledger'] ?? null) ? $w['ledger'] : [];
+    $domains = is_array($w['domains'] ?? null) ? $w['domains'] : [];
+
+    $minC = (int) ($w['min_commits'] ?? STAGE3C_MIN_COMMITS);
+    $minD = (float) ($w['min_days'] ?? STAGE3C_MIN_DAYS);
+    if ($minC <= 0) {
+        $minC = STAGE3C_MIN_COMMITS;
+    }
+    if ($minD <= 0) {
+        $minD = (float) STAGE3C_MIN_DAYS;
+    }
+
+    $commits = is_numeric($win['commits_in_window'] ?? null) ? (int) $win['commits_in_window'] : count($ledger);
+    $daysRaw = $win['days_elapsed'] ?? null;
+    $daysUnmeasured = !is_numeric($daysRaw);
+    $days = $daysUnmeasured ? 0.0 : (float) $daysRaw;
+    if ($daysUnmeasured) {
+        $notes[] = 'days-unmeasured';
+    }
+
+    // Syarat minimum window: >= 10 commit ATAU >= 14 hari (mana yang lebih dulu tercapai).
+    $windowSatisfied = ($commits >= $minC) || ($days >= $minD);
+
+    // XC(c) kelengkapan ledger: tiap baris wajib membawa bukti producer DAN observer.
+    $incomplete = 0;
+    foreach ($ledger as $row) {
+        if (!is_array($row)) {
+            $incomplete++;
+            continue;
+        }
+        $hasProd = trim((string) ($row['producer_pipeline'] ?? '')) !== '';
+        $hasObs  = trim((string) ($row['observer_job'] ?? '')) !== '';
+        if (!$hasProd || !$hasObs) {
+            $incomplete++;
+        }
+    }
+
+    // XC(a) pelanggaran keras: observer gagal pada commit yang producer-nya hijau.
+    $violations = [];
+    foreach ($ledger as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $obs = strtolower((string) ($row['observer_job_status'] ?? ''));
+        $pro = strtolower((string) ($row['producer_status'] ?? ''));
+        if (($obs === 'failed' || $obs === 'canceled') && $pro === 'success') {
+            $violations[] = (string) ($row['sha'] ?? '?') . ':' . $obs;
+        }
+    }
+    $declared = is_array($w['hard_violations'] ?? null) ? $w['hard_violations'] : [];
+    foreach ($declared as $v) {
+        if (is_scalar($v) && trim((string) $v) !== '') {
+            $violations[] = (string) $v;
+        }
+    }
+    $violations = array_values(array_unique($violations));
+
+    // XC(b) kegagalan beruntun. Bila observer tidak mengirim angkanya, hitung dari ledger
+    // (baris terurut TERBARU lebih dulu, sebagaimana dikembalikan API pipelines).
+    if (is_numeric($w['consecutive_failures'] ?? null)) {
+        $consec = (int) $w['consecutive_failures'];
+    } else {
+        $cur = 0;
+        $maxStreak = 0;
+        foreach ($ledger as $row) {
+            $st = is_array($row) ? strtolower((string) ($row['observer_job_status'] ?? '')) : '';
+            if ($st === 'failed') {
+                $cur++;
+                if ($cur > $maxStreak) {
+                    $maxStreak = $cur;
+                }
+            } else {
+                $cur = 0;
+            }
+        }
+        $consec = $maxStreak;
+    }
+
+    // Syarat minimum per domain (Evidence Contract v2).
+    $dv = static function (string $n) use ($domains): string {
+        $d = $domains[$n] ?? null;
+        return is_array($d) ? strtoupper((string) ($d['verdict'] ?? '')) : '';
+    };
+    $mustQualified = ['operational_resilience', 'canonical_ownership'];
+    $mustNotFail   = ['execution_parity', 'merge_control'];
+
+    if (!$windowSatisfied) {
+        $reasons[] = 'window-belum-minimum:' . $commits . 'commit/'
+            . ($daysUnmeasured ? 'n/a' : number_format($days, 2)) . 'hari (butuh >= '
+            . $minC . ' commit ATAU >= ' . $minD . ' hari)';
+    }
+    if ($incomplete > 0) {
+        $reasons[] = 'ledger-tidak-lengkap:' . $incomplete . '/' . count($ledger);
+    }
+    if ($violations !== []) {
+        $reasons[] = 'pelanggaran-keras:' . count($violations);
+    }
+    if ($consec >= 3) {
+        $reasons[] = 'kegagalan-beruntun:' . $consec;
+    }
+    foreach ($mustQualified as $n) {
+        $v = $dv($n);
+        if ($v !== DOMAIN_QUALIFIED) {
+            $reasons[] = 'domain-minimum:' . $n . '=' . ($v === '' ? 'unmeasured' : $v);
+        }
+    }
+    foreach ($mustNotFail as $n) {
+        $v = $dv($n);
+        if ($v === '') {
+            $reasons[] = 'domain-unmeasured:' . $n;
+        } elseif ($v === DOMAIN_FAIL) {
+            $reasons[] = 'domain-fail:' . $n;
+        }
+    }
+
+    $qualified = $reasons === [];
+
+    return [
+        'verdict' => $qualified ? STAGE3C_QUALIFIED : STAGE3C_NOT_QUALIFIED,
+        'qualified' => $qualified,
+        'window_satisfied' => $windowSatisfied,
+        'reasons' => $reasons,
+        'notes' => $notes,
+        'metrics' => [
+            'commits_in_window' => $commits,
+            'days_elapsed' => $daysUnmeasured ? null : $days,
+            'min_commits' => $minC,
+            'min_days' => $minD,
+            'ledger_total' => count($ledger),
+            'ledger_incomplete' => $incomplete,
+            'hard_violations' => count($violations),
+            'violation_refs' => array_slice($violations, 0, 10),
+            'consecutive_failures' => $consec,
+            'domains' => [
+                'execution_parity' => $dv('execution_parity'),
+                'operational_resilience' => $dv('operational_resilience'),
+                'merge_control' => $dv('merge_control'),
+                'canonical_ownership' => $dv('canonical_ownership'),
+            ],
+        ],
+    ];
+}
+
+/**
+ * Mode `--stage3c-window=FILE` (Gate D).
+ *
+ * Membaca window JSON, menghitung verdict jendela formal Tahap 3c, mencetak ringkasan, lalu
+ * menulis `stage3c-verdict.json` ke out-dir. Fail-closed:
+ *   0 = perhitungan BERHASIL (QUALIFIED maupun NOT_QUALIFIED - status terbuka tetap dilaporkan
+ *       jujur sebagai status, BUKAN kegagalan job, sejalan dengan observer yang tetap hijau saat
+ *       `overall=PARTIAL`; pakai `--stage3c-strict` untuk menjadikannya gate keras);
+ *   1 = NOT_QUALIFIED DAN `--stage3c-strict` diberikan;
+ *   2 = window tak terbaca / schema tidak dikenal (pengukuran GAGAL - tidak boleh diam).
+ *
+ * @param string $file   path window JSON
+ * @param string $outDir direktori keluaran
+ * @return int kode keluar
+ */
+function stage3cMode(string $file, string $outDir, bool $compact = false, bool $strict = false): int
+{
+    if (!is_file($file)) {
+        fwrite(STDERR, "ERROR: window Stage 3c tidak ditemukan: {$file}\n");
+        return EXIT_ERROR;
+    }
+    $w = json_decode((string) @file_get_contents($file), true);
+    if (!is_array($w)) {
+        fwrite(STDERR, "ERROR: window Stage 3c bukan objek JSON: {$file}\n");
+        return EXIT_ERROR;
+    }
+    if ((string) ($w['schema'] ?? '') !== STAGE3C_WINDOW_SCHEMA) {
+        fwrite(STDERR, 'ERROR: schema window Stage 3c tidak dikenal: ' . (string) ($w['schema'] ?? '(kosong)') . "\n");
+        return EXIT_ERROR;
+    }
+
+    $v = computeStage3cVerdict($w);
+    $m = $v['metrics'];
+
+    if (!$compact) {
+        echo "== GATE D - JENDELA FORMAL TAHAP 3C (fail-closed) ==\n";
+        printf(
+            "  window      : commit=%d hari=%s (minimum %d commit ATAU %s hari)\n",
+            (int) $m['commits_in_window'],
+            $m['days_elapsed'] === null ? 'n/a' : number_format((float) $m['days_elapsed'], 2),
+            (int) $m['min_commits'],
+            number_format((float) $m['min_days'], 0)
+        );
+        printf("  window_sat. : %s\n", $v['window_satisfied'] ? 'ya' : 'tidak');
+        printf(
+            "  ledger      : lengkap=%d/%d tidak_lengkap=%d\n",
+            (int) $m['ledger_total'] - (int) $m['ledger_incomplete'],
+            (int) $m['ledger_total'],
+            (int) $m['ledger_incomplete']
+        );
+        printf(
+            "  keras       : pelanggaran=%d kegagalan_beruntun=%d\n",
+            (int) $m['hard_violations'],
+            (int) $m['consecutive_failures']
+        );
+        printf(
+            "  domain v2   : execution_parity=%s operational_resilience=%s merge_control=%s canonical_ownership=%s\n",
+            (string) $m['domains']['execution_parity'],
+            (string) $m['domains']['operational_resilience'],
+            (string) $m['domains']['merge_control'],
+            (string) $m['domains']['canonical_ownership']
+        );
+        foreach ($v['notes'] as $n) {
+            echo '  catatan     : ' . (string) $n . "\n";
+        }
+        foreach ($v['reasons'] as $r) {
+            echo '  penghambat  : ' . (string) $r . "\n";
+        }
+        echo '== STAGE 3C: ' . (string) $v['verdict'] . " ==\n";
+    }
+
+    if (!is_dir($outDir) && !@mkdir($outDir, 0775, true) && !is_dir($outDir)) {
+        fwrite(STDERR, "WARN: tidak bisa membuat direktori {$outDir}\n");
+    } else {
+        $payload = [
+            'schema' => STAGE3C_VERDICT_SCHEMA,
+            'generated_at' => gmdate('c'),
+            'window_file' => $file,
+            'verdict' => $v['verdict'],
+            'qualified' => $v['qualified'],
+            'window_satisfied' => $v['window_satisfied'],
+            'reasons' => $v['reasons'],
+            'notes' => $v['notes'],
+            'metrics' => $m,
+        ];
+        $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if (is_string($json)) {
+            @file_put_contents(rtrim($outDir, '/') . '/stage3c-verdict.json', $json . "\n");
+            echo 'stage3c-verdict: ' . rtrim($outDir, '/') . "/stage3c-verdict.json\n";
+        }
+    }
+
+    if ($strict && !$v['qualified']) {
+        echo "== STAGE 3C: NOT_QUALIFIED (strict -> keluar 1) ==\n";
+        return EXIT_VIOLATION;
+    }
     return EXIT_PASS;
 }
 
@@ -2271,6 +2573,93 @@ function selftest(): int
     // Identitas sama namun beda kapitalisasi hex -> tetap cocok (bukan kegagalan palsu).
     $bcase = assertEvidenceCorrelation($mkCtx(['contract' => ['mirror_sha' => strtoupper(str_repeat('b', 40))]]));
     $ok('GateB hex beda kapitalisasi -> tetap cocok', $bcase['failures'] === []);
+
+    // -----------------------------------------------------------------------
+    // Gate D (#36) - jendela formal Tahap 3c (fungsi MURNI).
+    // -----------------------------------------------------------------------
+    $domDN = [
+        'execution_parity' => ['verdict' => DOMAIN_PARTIAL],
+        'operational_resilience' => ['verdict' => DOMAIN_QUALIFIED],
+        'merge_control' => ['verdict' => DOMAIN_PARTIAL],
+        'canonical_ownership' => ['verdict' => DOMAIN_QUALIFIED],
+    ];
+    $mkWin = static function (array $over = [], int $rows = 12) use ($domDN): array {
+        $ledger = [];
+        for ($i = 0; $i < $rows; $i++) {
+            $ledger[] = [
+                'sha' => str_repeat('a', 40), 'producer_pipeline' => 1, 'producer_status' => 'success',
+                'observer_pipeline' => 2, 'observer_job' => '3', 'observer_job_status' => 'success',
+            ];
+        }
+        $base = [
+            'schema' => STAGE3C_WINDOW_SCHEMA,
+            'min_commits' => 10,
+            'min_days' => 14,
+            'window' => ['commits_in_window' => $rows, 'days_elapsed' => 3.0],
+            'domains' => $domDN,
+            'hard_violations' => [],
+            'consecutive_failures' => 0,
+            'ledger' => $ledger,
+        ];
+        return array_replace_recursive($base, $over);
+    };
+    // Window terpenuhi (12 commit >= 10), ledger lengkap, 0 pelanggaran, domain minimum OK.
+    $s3ok = computeStage3cVerdict($mkWin());
+    $ok('GateD window 12 commit + ledger lengkap -> QUALIFIED', $s3ok['verdict'] === STAGE3C_QUALIFIED && $s3ok['qualified'] === true);
+    $ok('GateD window_satisfied=true', $s3ok['window_satisfied'] === true);
+    // Window BELUM minimum (4 commit / 3 hari) -> NOT_QUALIFIED + alasan kuantitatif.
+    $s3short = computeStage3cVerdict($mkWin(['window' => ['commits_in_window' => 4, 'days_elapsed' => 3.0]], 4));
+    $ok('GateD window kurang (4 commit / 3 hari) -> NOT_QUALIFIED', $s3short['verdict'] === STAGE3C_NOT_QUALIFIED && $s3short['window_satisfied'] === false);
+    $ok('GateD alasan window kuantitatif dilaporkan', in_array(
+        'window-belum-minimum:4commit/3.00hari (butuh >= 10 commit ATAU >= 14 hari)',
+        $s3short['reasons'],
+        true
+    ));
+    // OR: 14 hari walau commit < 10 -> window_satisfied tetap true (mana yang lebih dulu).
+    $s3days = computeStage3cVerdict($mkWin(['window' => ['commits_in_window' => 5, 'days_elapsed' => 14.2]], 5));
+    $ok('GateD 14 hari walau 5 commit -> window_satisfied=true (OR)', $s3days['window_satisfied'] === true && $s3days['verdict'] === STAGE3C_QUALIFIED);
+    // Ledger tidak lengkap -> NOT_QUALIFIED (XC(c)).
+    $s3led = computeStage3cVerdict(array_replace_recursive($mkWin(), [
+        'ledger' => [array_replace_recursive($mkWin()['ledger'][0], ['observer_job' => ''])],
+    ]));
+    $ok('GateD ledger tak lengkap -> NOT_QUALIFIED', $s3led['verdict'] === STAGE3C_NOT_QUALIFIED
+        && $s3led['metrics']['ledger_incomplete'] === 1);
+    // Pelanggaran keras (observer gagal pada producer hijau) -> NOT_QUALIFIED.
+    $s3v = computeStage3cVerdict(array_replace_recursive($mkWin(), [
+        'ledger' => [array_replace_recursive($mkWin()['ledger'][0], ['observer_job_status' => 'failed'])],
+    ]));
+    $ok('GateD pelanggaran keras -> NOT_QUALIFIED', $s3v['verdict'] === STAGE3C_NOT_QUALIFIED
+        && $s3v['metrics']['hard_violations'] === 1);
+    // 3 kegagalan beruntun -> NOT_QUALIFIED (XC(b)).
+    $s3c = computeStage3cVerdict(array_replace_recursive($mkWin(), ['consecutive_failures' => 3]));
+    $ok('GateD 3 kegagalan beruntun -> NOT_QUALIFIED', $s3c['verdict'] === STAGE3C_NOT_QUALIFIED
+        && in_array('kegagalan-beruntun:3', $s3c['reasons'], true));
+    // Domain minimum: canonical_ownership PARTIAL -> NOT_QUALIFIED.
+    $s3d = computeStage3cVerdict(array_replace_recursive($mkWin(), [
+        'domains' => ['canonical_ownership' => ['verdict' => DOMAIN_PARTIAL]],
+    ]));
+    $ok('GateD canonical_ownership PARTIAL -> NOT_QUALIFIED', $s3d['verdict'] === STAGE3C_NOT_QUALIFIED
+        && in_array('domain-minimum:canonical_ownership=PARTIAL', $s3d['reasons'], true));
+    // execution_parity FAIL -> NOT_QUALIFIED.
+    $s3f = computeStage3cVerdict(array_replace_recursive($mkWin(), [
+        'domains' => ['execution_parity' => ['verdict' => DOMAIN_FAIL]],
+    ]));
+    $ok('GateD execution_parity FAIL -> NOT_QUALIFIED', $s3f['verdict'] === STAGE3C_NOT_QUALIFIED
+        && in_array('domain-fail:execution_parity', $s3f['reasons'], true));
+    // Domain tak terukur -> NOT_QUALIFIED (fail-closed), bukan dianggap lulus.
+    $s3u = computeStage3cVerdict(array_replace_recursive($mkWin(), ['domains' => ['merge_control' => ['verdict' => '']]]));
+    $ok('GateD domain tak terukur -> NOT_QUALIFIED (fail-closed)', $s3u['verdict'] === STAGE3C_NOT_QUALIFIED
+        && in_array('domain-unmeasured:merge_control', $s3u['reasons'], true));
+    // Hari tak terukur + commit < minimum -> NOT_QUALIFIED + catatan eksplisit (bukan "tak terbatas").
+    $s3nd = computeStage3cVerdict($mkWin(['window' => ['commits_in_window' => 3, 'days_elapsed' => null]], 3));
+    $ok('GateD hari tak terukur diperlakukan 0 -> NOT_QUALIFIED + days-unmeasured',
+        $s3nd['verdict'] === STAGE3C_NOT_QUALIFIED
+        && $s3nd['window_satisfied'] === false
+        && in_array('days-unmeasured', $s3nd['notes'], true));
+    // Hari tak terukur namun commit >= minimum -> window tetap terpenuhi lewat jalur commit.
+    $s3nc = computeStage3cVerdict($mkWin(['window' => ['commits_in_window' => 12, 'days_elapsed' => null]], 12));
+    $ok('GateD hari tak terukur tapi commit>=min -> tetap QUALIFIED (jalur commit)',
+        $s3nc['verdict'] === STAGE3C_QUALIFIED && $s3nc['window_satisfied'] === true);
 
     echo $fail === 0 ? "== selftest: LULUS ==\n" : "== selftest: {$fail} GAGAL ==\n";
     return $fail === 0 ? EXIT_PASS : EXIT_VIOLATION;
