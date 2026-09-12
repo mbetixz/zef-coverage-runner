@@ -38,10 +38,22 @@ name: zef-phpstan
 
 on:
   # Branch terdedikasi: di-push oleh job GitLab `phpstan-offload`.
-  # Push (bukan workflow_dispatch) dipakai supaya deterministik dan tidak
-  # bergantung pada izin `actions: write` milik token otomasi.
+  # `main` IKUT dipantau supaya gate ini tetap hidup & terverifikasi SETELAH
+  # perubahan ini di-merge (mencegahnya menjadi dead-code yang hanya berjalan
+  # di branch dedikasi).
+  #
+  # KONTRAK DURABILITAS (terverifikasi dari .gitlab-ci.yml job
+  # `coverage-offload`, whitelist: composer.json composer.lock phpunit.xml.dist
+  # src tests tools): script sync melakukan `rm -rf` + `cp -a` HANYA untuk path
+  # di whitelist tersebut dan TIDAK PERNAH menghapus berkas di luar whitelist.
+  # Karena itu phpstan.neon.dist, phpstan-ci.neon, phpstan-baseline*.json,
+  # index.php, quality-gate.php, dan .github/workflows/phpstan.yml pada branch
+  # `main` repo ini PERSISTEN lintas sync coverage.
+  # Catatan: `tools/` ADA di whitelist, sehingga tools/verify-baseline-drift.php
+  # pada main akan ditimpa oleh versi GitLab main — versi itu SUDAH identik
+  # (sha256 sama), jadi sync bersifat idempoten.
   push:
-    branches: ["ci/phpstan-offload-github"]
+    branches: ["ci/phpstan-offload-github", "main"]
   # Jalur manual untuk re-run / eksekusi lokal.
   workflow_dispatch:
 
@@ -160,6 +172,26 @@ jobs:
           else
             echo "WARN: phpstan-report.json kosong / tidak ada"
           fi
+
+      - name: Ringkasan GitHub Step Summary
+        if: always()
+        run: |
+          f=var/phpstan/phpstan-report.json
+          n="n/a"
+          if [ -s "$f" ]; then
+            n="$(php -r '$d=json_decode((string) file_get_contents($argv[1]), true); echo is_array($d) ? count($d) : 0;' "$f" 2>/dev/null || echo n/a)"
+          fi
+          {
+            echo "## zef-phpstan (GitHub Actions)"
+            echo ""
+            echo "| Item | Nilai |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| Konfigurasi | \`phpstan-ci.neon\` (overlay \`maximumNumberOfProcesses: 2\`) |"
+            echo "| Entri report | ${n} |"
+            echo "| Runner | 2 vCPU / 7 GB (ubuntu-latest) |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload phpstan report (always)
         if: always()
