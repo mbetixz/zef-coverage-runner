@@ -117,6 +117,10 @@ const STAGE3C_NOT_QUALIFIED = 'NOT_QUALIFIED';
  * dicampur ke keranjang kualifikasi. Bila anchor tidak terdefinisi -> fail-closed.
  */
 const STAGE3C_ANCHOR_SCHEMA = 'zef.coverage-gate.qualification-anchor/v1';
+/** Gate E (#40): schema penanda KESIAPAN hardening merge-control (READ-ONLY, fail-closed). */
+const GATE_E_READINESS_SCHEMA = 'zef.coverage-gate.gate-e-readiness/v1';
+const GATE_E_READY     = 'READY';
+const GATE_E_NOT_READY = 'NOT_READY';
 
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
@@ -1438,6 +1442,73 @@ function computeStage3cVerdict(array $w): array
 
     $qualified = $reasons === [];
 
+    // -----------------------------------------------------------------------
+    // Gate E (#40) - KESIAPAN HARDENING merge-control (READ-ONLY, fail-closed).
+    //   "Siap mengubah bypass_mode" BUKAN opini: ia dikonstruksi dari fakta yang
+    //   sudah terukur, dan SETIAP fakta yang tak terukur dihitung BELUM SIAP -
+    //   bukan dianggap aman. Keluaran ini TIDAK mengubah verdict Stage 3c maupun
+    //   verdict domain mana pun; ia hanya menyatakan apakah prasyarat terpenuhi.
+    //     R1 stage3c : clean window Stage 3c benar-benar QUALIFIED
+    //     R2 bypass  : daftar bypass TERUKUR (bypass_actors_known=true) - tanpa itu
+    //                  "mempersempit mode" adalah tindakan buta
+    //     R3 race    : tidak ada race artifact (<= 1 run coverage.yml per SHA)
+    //     R4 change  : tidak ada perubahan merge-control yang tertunda/untracked
+    //     R5 attest  : attestation blob utuh (enumerated == audited == whitelisted)
+    // -----------------------------------------------------------------------
+    $readyReasons = [];
+    if (!$qualified) {
+        $readyReasons[] = 'stage3c-not-qualified:' . $commits . 'commit-bersih/'
+            . ($daysUnmeasured ? 'n/a' : number_format($days, 4)) . 'hari-bersih'
+            . ' (butuh >= ' . $minC . ' commit ATAU >= ' . $minD . ' hari)';
+    }
+    $mcObs = is_array($domains['merge_control']['observability'] ?? null)
+        ? $domains['merge_control']['observability'] : [];
+    $bypassKnownReady = (($mcObs['bypass_actors_known'] ?? null) === true)
+        || (($w['bypass_actors_known'] ?? null) === true);
+    if (!$bypassKnownReady) {
+        $readyReasons[] = 'bypass-actors-unmeasured:daftar-bypass-tak-terlihat-kredensial';
+    }
+    $raceMeasured = ($w['artifact_race_measured'] ?? null) === true;
+    $raceCount = is_numeric($w['artifact_race_count'] ?? null) ? (int) $w['artifact_race_count'] : null;
+    if (!$raceMeasured || $raceCount === null) {
+        $readyReasons[] = 'artifact-race-unmeasured';
+    } elseif ($raceCount > 1) {
+        $readyReasons[] = 'artifact-race-present:' . $raceCount . 'run-per-sha';
+    }
+    $pendingMc = $w['pending_merge_control_change'] ?? null;
+    if ($pendingMc === true) {
+        $readyReasons[] = 'merge-control-change-pending';
+    } elseif ($pendingMc !== false) {
+        $readyReasons[] = 'merge-control-change-untracked';
+    }
+    $mf = is_array($w['mirror'] ?? null) ? $w['mirror'] : [];
+    $mfEnum = is_numeric($mf['enumerated'] ?? null) ? (int) $mf['enumerated'] : 0;
+    $mfAud  = is_numeric($mf['audited'] ?? null) ? (int) $mf['audited'] : 0;
+    $mfWhi  = is_numeric($mf['whitelisted'] ?? null) ? (int) $mf['whitelisted'] : 0;
+    $mfFnd  = (int) ($mf['findings_unexpected'] ?? 0) + (int) ($mf['findings_missing'] ?? 0)
+        + (int) ($mf['secret_found'] ?? 0) + (int) ($mf['fetch_err'] ?? 0);
+    if ($mfEnum <= 0 || $mfEnum !== $mfAud || $mfEnum !== $mfWhi) {
+        $readyReasons[] = 'blob-attestation-missing:' . $mfEnum . '/' . $mfAud . '/' . $mfWhi;
+    } elseif ($mfFnd !== 0) {
+        $readyReasons[] = 'blob-attestation-findings:' . $mfFnd;
+    }
+    $readiness = [
+        'schema' => GATE_E_READINESS_SCHEMA,
+        'state' => $readyReasons === [] ? GATE_E_READY : GATE_E_NOT_READY,
+        'ready' => $readyReasons === [],
+        'reasons' => $readyReasons,
+        'checks' => [
+            'stage3c_qualified' => $qualified,
+            'bypass_actors_known' => $bypassKnownReady,
+            'artifact_race_measured' => $raceMeasured,
+            'artifact_race_count' => $raceCount,
+            'pending_merge_control_change' => $pendingMc,
+            'blob_attestation' => ($mfEnum > 0 && $mfEnum === $mfAud && $mfEnum === $mfWhi) ? 'ok' : 'missing',
+        ],
+        'blocked_by' => 'clean-window-qualified',
+        'note' => 'Read-only: TIDAK ada perubahan ruleset/bypass/PAT/variabel CI pada putaran ini.',
+    ];
+
     return [
         'verdict' => $qualified ? STAGE3C_QUALIFIED : STAGE3C_NOT_QUALIFIED,
         'qualified' => $qualified,
@@ -1452,6 +1523,7 @@ function computeStage3cVerdict(array $w): array
             'canonical_cutover' => 'NOT_APPROVED',
             'held_until' => 'clean-window-qualified',
         ],
+        'gate_e_readiness' => $readiness,
         'anchor' => [
             'defined' => $anchorDefined,
             'sha' => $anchorSha,
@@ -1580,7 +1652,28 @@ function stage3cMode(string $file, string $outDir, bool $compact = false, bool $
             (string) $v['hold']['canonical_cutover'],
             (string) $v['hold']['held_until']
         );
+        // Gate E (#40) - KESIAPAN hardening merge-control. Terlihat di TRACE,
+        // bukan hanya di dokumen; fail-closed: prasyarat tak terukur = NOT_READY.
+        printf(
+            "  gate-e      : readiness=%s (diperiksa dari fakta terukur; read-only)\n",
+            (string) $v['gate_e_readiness']['state']
+        );
+        foreach ($v['gate_e_readiness']['reasons'] as $gr) {
+            echo '  gate-e-blokir: ' . (string) $gr . "\n";
+        }
+        printf(
+            "  gate-e-ukur : stage3c=%s bypass_known=%s race=%s/%s pending_change=%s attest=%s\n",
+            $v['gate_e_readiness']['checks']['stage3c_qualified'] ? 'ya' : 'TIDAK',
+            $v['gate_e_readiness']['checks']['bypass_actors_known'] ? 'ya' : 'TIDAK',
+            $v['gate_e_readiness']['checks']['artifact_race_measured'] ? 'terukur' : 'TAK-TERUKUR',
+            $v['gate_e_readiness']['checks']['artifact_race_count'] === null
+                ? 'n/a' : (string) $v['gate_e_readiness']['checks']['artifact_race_count'],
+            $v['gate_e_readiness']['checks']['pending_merge_control_change'] === false
+                ? 'tidak' : ($v['gate_e_readiness']['checks']['pending_merge_control_change'] === true ? 'YA' : 'untracked'),
+            (string) $v['gate_e_readiness']['checks']['blob_attestation']
+        );
         echo '== STAGE 3C: ' . (string) $v['verdict'] . " ==\n";
+        echo '== GATE E READINESS: ' . (string) $v['gate_e_readiness']['state'] . " ==\n";
     }
 
     if (!is_dir($outDir) && !@mkdir($outDir, 0775, true) && !is_dir($outDir)) {
@@ -1597,6 +1690,7 @@ function stage3cMode(string $file, string $outDir, bool $compact = false, bool $
             'notes' => $v['notes'],
             'anchor' => $v['anchor'],
             'hold' => $v['hold'],
+            'gate_e_readiness' => $v['gate_e_readiness'],
             'metrics' => $m,
         ];
         $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
@@ -2853,6 +2947,69 @@ function selftest(): int
         in_array('current_user_can_bypass', $eCDom['merge_control']['observability']['keys'] ?? [], true));
     $ok('GateE actor_ids terekam pada jalur terukur',
         ($eAct['merge_control']['observability']['actor_ids'] ?? []) === ['4911046']);
+
+    // -----------------------------------------------------------------------
+    // Gate E (#40) - KESIAPAN HARDENING merge-control (READ-ONLY, fail-closed).
+    //   Prasyarat dihitung dari fakta yang sudah terukur; fakta tak terukur ->
+    //   NOT_READY (bukan dianggap aman). Penanda ini TIDAK mengubah verdict
+    //   Stage 3c maupun verdict domain.
+    // -----------------------------------------------------------------------
+    // (a) Semua fakta siap -> READY, dan verdict Stage 3c TIDAK ikut berubah.
+    $eReadyWin = $mkWin([
+        'artifact_race_measured' => true, 'artifact_race_count' => 1,
+        'pending_merge_control_change' => false,
+        'mirror' => ['enumerated' => 552, 'audited' => 552, 'whitelisted' => 552],
+    ]);
+    // merge_control harus "known" agar prasyarat R2 terpenuhi -> pakai context yang terukur.
+    $eReadyWin['domains']['merge_control']['observability'] = ['bypass_actors_known' => true];
+    $eReady = computeStage3cVerdict($eReadyWin);
+    $ok('GateE-redy semua fakta siap -> READY', $eReady['gate_e_readiness']['state'] === GATE_E_READY
+        && $eReady['gate_e_readiness']['ready'] === true);
+    $ok('GateE-redy penanda readiness TIDAK mengubah verdict Stage 3c',
+        ($eReady['verdict'] === STAGE3C_QUALIFIED) === $eReady['qualified']);
+    // (b) Stage 3c belum qualified -> NOT_READY + alasan kuantitatif (kondisi saat ini).
+    $eNotWin = $eReadyWin;
+    $eNotWin['window'] = ['commits_in_window' => 3, 'days_elapsed' => 0.0679];
+    $eNot = computeStage3cVerdict($eNotWin);
+    $ok('GateE-redy stage3c belum qualified -> NOT_READY', $eNot['gate_e_readiness']['state'] === GATE_E_NOT_READY);
+    $ok('GateE-redy alasan memuat angka bersih + ambang minimum',
+        (bool) preg_grep('/^stage3c-not-qualified:3commit-bersih\/0\.0679hari-bersih \(butuh >= 10 commit ATAU >= 14 hari\)$/',
+            $eNot['gate_e_readiness']['reasons']));
+    // (c) Bypass tak terukur -> NOT_READY (memperkeci mode tanpa daftar = tindakan buta).
+    $eBlindWin = $eReadyWin;
+    $eBlindWin['domains']['merge_control']['observability'] = ['bypass_actors_known' => false];
+    $eBlind = computeStage3cVerdict($eBlindWin);
+    $ok('GateE-redy bypass tak terukur -> NOT_READY', $eBlind['gate_e_readiness']['state'] === GATE_E_NOT_READY
+        && in_array('bypass-actors-unmeasured:daftar-bypass-tak-terlihat-kredensial', $eBlind['gate_e_readiness']['reasons'], true));
+    // (d) Race artifact terukur > 1 -> NOT_READY (justru race yang merusak clean window).
+    $eRaceWin = $eReadyWin;
+    $eRaceWin['artifact_race_count'] = 2;
+    $eRace = computeStage3cVerdict($eRaceWin);
+    $ok('GateE-redy race artifact > 1 -> NOT_READY', $eRace['gate_e_readiness']['state'] === GATE_E_NOT_READY
+        && in_array('artifact-race-present:2run-per-sha', $eRace['gate_e_readiness']['reasons'], true));
+    // (e) Fakta tak terukur -> NOT_READY (fail-closed), BUKAN dianggap aman.
+    $eUnm = computeStage3cVerdict($mkWin());
+    $ok('GateE-redy race tak terukur -> NOT_READY (fail-closed)',
+        $eUnm['gate_e_readiness']['state'] === GATE_E_NOT_READY
+        && in_array('artifact-race-unmeasured', $eUnm['gate_e_readiness']['reasons'], true));
+    $ok('GateE-redy perubahan merge-control tak terlacak -> NOT_READY',
+        in_array('merge-control-change-untracked', $eUnm['gate_e_readiness']['reasons'], true));
+    $ok('GateE-redy attestation blob belum ada -> NOT_READY',
+        in_array('blob-attestation-missing:0/0/0', $eUnm['gate_e_readiness']['reasons'], true));
+    // (f) Perubahan merge-control tertunda (true) -> NOT_READY eksplisit.
+    $ePendWin = $eReadyWin;
+    $ePendWin['pending_merge_control_change'] = true;
+    $ok('GateE-redy perubahan merge-control tertunda -> NOT_READY',
+        in_array('merge-control-change-pending', computeStage3cVerdict($ePendWin)['gate_e_readiness']['reasons'], true));
+    // (g) Attestation blob ada temuan -> NOT_READY.
+    $eFndWin = $eReadyWin;
+    $eFndWin['mirror']['findings_unexpected'] = 1;
+    $ok('GateE-redy attestation blob ada temuan -> NOT_READY',
+        in_array('blob-attestation-findings:1', computeStage3cVerdict($eFndWin)['gate_e_readiness']['reasons'], true));
+    // (h) READY pun TIDAK memindahkan Stage 4 / cutover (tetap HOLD / NOT_APPROVED).
+    $ok('GateE-redy READY tidak mengubah hold.stage4=HOLD', (string) $eReady['hold']['stage4'] === 'HOLD');
+    $ok('GateE-redy READY tidak mengubah cutover=NOT_APPROVED',
+        (string) $eReady['hold']['canonical_cutover'] === 'NOT_APPROVED');
 
     // -----------------------------------------------------------------------
     // Gate F hardening (#39) - GUARD REGRESI pada PEMBUNGKUS SHELL observer.
