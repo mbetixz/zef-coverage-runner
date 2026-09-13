@@ -121,6 +121,23 @@ const STAGE3C_ANCHOR_SCHEMA = 'zef.coverage-gate.qualification-anchor/v1';
 const GATE_E_READINESS_SCHEMA = 'zef.coverage-gate.gate-e-readiness/v1';
 const GATE_E_READY     = 'READY';
 const GATE_E_NOT_READY = 'NOT_READY';
+/**
+ * F1 (WAVE 1) - JENDELA PARITAS TERANCHOR: SATU SUMBER TUNGGAL.
+ *
+ * Sebelum F1 ada DUA definisi window: (a) jendela sampel `--max`/`--sample-days` pada
+ * jalur paritas P1-P12, dan (b) qualification anchor Gate F pada jalur Tahap 3c. Akibatnya
+ * commit PRA-anchor (era insiden determinisme, mis. b80e14a7) masih bisa tersampel oleh
+ * paritas dan - karena P8 fail-closed - menggagalkan observer, padahal commit itu memang
+ * SUDAH tidak relevan bagi kualifikasi. F1 menyatukan keduanya: `qualificationAnchor()`
+ * menjadi satu-satunya sumber jendela kualifikasi, dipakai oleh KEDUA jalur.
+ *
+ * Fail-closed TETAP: anchor tak terdefinisi -> tidak pernah QUALIFIED, dan pelanggaran pada
+ * commit >= anchor tetap KERAS. Pelanggaran PRA-anchor DIKECUALIKAN secara EKSPLISIT
+ * (dilaporkan terpisah), BUKAN diabaikan diam-diam.
+ */
+const PARITY_WINDOW_ANCHOR    = 'anchor';
+const PARITY_WINDOW_SAMPLE    = 'sample-days';
+const PARITY_WINDOW_UNDEFINED = 'anchor-undefined';
 
 // Ambang kebijakan (dapat dioverride lewat flag).
 $POLICY = [
@@ -197,12 +214,37 @@ $strictNumeric = (bool) $opt('strict-numeric', false);
 //   tidak hilang - ia hanya tidak diberlakukan saat contract sudah otoritatif.
 $evidenceAuthoritative = (bool) $opt('evidence-authoritative', false);
 $baseline = (string) $opt('baseline', '');
+// F1 (WAVE 1): berkas qualification anchor - SATU SUMBER TUNGGAL jendela kualifikasi.
+// Jalur paritas P1-P12 memakai window yang SAMA dengan clean-window Tahap 3c, sehingga
+// commit pra-anchor (era insiden determinisme) tidak lagi dapat menggagalkan observer.
+$anchorFile = (string) $opt('anchor-file', '');
 
 $POLICY['line_tol']    = (float) $opt('line-tol', $POLICY['line_tol']);
 $POLICY['branch_tol']  = (float) $opt('branch-tol', $POLICY['branch_tol']);
 $POLICY['tests_tol']   = (int) $opt('tests-tol', $POLICY['tests_tol']);
 $POLICY['sample_days'] = (int) $opt('sample-days', $POLICY['sample_days']);
 $POLICY['duration_tol'] = (float) $opt('duration-tol', $POLICY['duration_tol']);
+
+// ---------------------------------------------------------------------------
+// F1 (WAVE 1) - JENDELA PARITAS TERANCHOR. SATU sumber: qualificationAnchor().
+//   Diletakkan SEBELUM validasi token & panggilan jaringan apa pun supaya fail-closed
+//   benar-benar murah: anchor yang hilang/tak terdefinisi = ERROR seketika, TANPA API.
+//
+//   anchor terdefinisi     -> batas jendela = waktu anchor (commit pra-anchor TIDAK disampel)
+//   anchor tak terdefinisi -> mode anchor-undefined: jendela KOSONG (fail-closed)
+//   tanpa --anchor-file    -> mode sample-days (perilaku lama, dipertahankan)
+// ---------------------------------------------------------------------------
+$anchor     = $anchorFile !== '' ? qualificationAnchor($anchorFile) : null;
+$anchorMode = $anchor !== null ? 'anchor-observed' : 'unused';
+[$cutoff, $windowMode] = resolveWindowCutoff($anchor, $POLICY['sample_days']);
+// F1 - FAIL-CLOSED TEGAS pada jalur observer: `--require-anchor` melarang mundur ke jendela
+// `sample-days`. Berkas anchor yang HILANG / tak terdefinisi TIDAK boleh diam-diam memberi
+// jendela yang LEBIH LONGGAR (itu justru akan memunculkan kembali commit pra-anchor).
+$requireAnchor = (bool) $opt('require-anchor', false);
+if ($requireAnchor && ($anchor === null || ($anchor['defined'] ?? false) !== true)) {
+    fwrite(STDERR, "ERROR: --require-anchor diberikan tetapi qualification anchor TIDAK terdefinisi (fail-closed).\n");
+    exit(EXIT_ERROR);
+}
 
 $glToken = (string) ($opt('gl-token') ?: getenv('ZEF_GITLAB_TOKEN') ?: getenv('GITLAB_TOKEN') ?: '');
 $ghToken = (string) ($opt('gh-token') ?: getenv('GITHUB_TOKEN') ?: getenv('GH_TOKEN') ?: '');
@@ -450,6 +492,130 @@ function mapConclusionToState(string $conclusion): string
 }
 
 // ---------------------------------------------------------------------------
+// F1 (WAVE 1) - JENDELA PARITAS TERANCHOR: FUNGSI MURNI (tanpa jaringan, dapat diuji).
+// ---------------------------------------------------------------------------
+/**
+ * SATU SUMBER TUNGGAL qualification anchor (dibaca dari berkas yang di-commit).
+ *
+ * Dipakai BAIK oleh mode `--stage3c-window` (clean-window Tahap 3c) MAUPUN oleh jalur
+ * sampling paritas P1-P12 - sehingga window kualifikasi TIDAK PERNAH punya dua definisi.
+ *
+ * Fail-closed: `defined:true` tetapi SHA bukan 40 hex / waktu tak terbaca -> `defined:false`.
+ * Berkas absen -> `absent:true` (pemanggil boleh lanjut tanpa anchor, tetapi TIDAK boleh
+ * mengklaim jendela kualifikasi). Tidak pernah mengarang anchor.
+ *
+ * @return array{defined:bool,sha:string,at:string,reset_at:string,reason:string,absent:bool}
+ */
+function qualificationAnchor(string $file): array
+{
+    $out = ['defined' => false, 'sha' => '', 'at' => '', 'reset_at' => '', 'reason' => '', 'absent' => true];
+    if ($file === '' || !is_file($file)) {
+        return $out;
+    }
+    $out['absent'] = false;
+    $raw = @file_get_contents($file);
+    if (!is_string($raw) || $raw === '') {
+        return $out;
+    }
+    $d = json_decode($raw, true);
+    if (!is_array($d)) {
+        return $out;
+    }
+    $sha = trim((string) ($d['sha'] ?? ''));
+    $at  = trim((string) ($d['at'] ?? ''));
+    if (($d['defined'] ?? null) !== true) {
+        return $out;
+    }
+    if (preg_match('/^[0-9a-f]{40}$/', $sha) !== 1 || $at === '' || strtotime($at) === false) {
+        return $out;
+    }
+    $out['defined']  = true;
+    $out['sha']      = $sha;
+    $out['at']       = $at;
+    $out['reset_at'] = trim((string) ($d['reset_at'] ?? ''));
+    $out['reason']   = trim((string) ($d['reason'] ?? ''));
+    return $out;
+}
+
+/**
+ * F1 - BATAS JENDELA TUNGGAL: anchor bila terdefinisi, jika tidak `sample-days`.
+ *
+ * Anchor `defined:false` yang SENGAJA diberikan (bukan absen) -> cutoff 0 + mode
+ * `anchor-undefined`, sehingga pemanggil TIDAK boleh memberi jendela longgar.
+ *
+ * @param array<string,mixed>|null $anchor hasil qualificationAnchor() (null = tak dipakai)
+ * @return array{0:int,1:string} [cutoffEpoch, mode]
+ */
+function resolveWindowCutoff(?array $anchor, int $sampleDays): array
+{
+    if ($anchor !== null) {
+        if (($anchor['defined'] ?? false) === true && (string) ($anchor['at'] ?? '') !== '') {
+            $ts = strtotime((string) $anchor['at']);
+            if ($ts !== false) {
+                return [(int) $ts, PARITY_WINDOW_ANCHOR];
+            }
+        }
+        if (($anchor['absent'] ?? false) === true) {
+            return [$sampleDays > 0 ? time() - ($sampleDays * 86400) : 0, PARITY_WINDOW_SAMPLE];
+        }
+        return [0, PARITY_WINDOW_UNDEFINED];
+    }
+    return [$sampleDays > 0 ? time() - ($sampleDays * 86400) : 0, PARITY_WINDOW_SAMPLE];
+}
+
+/**
+ * F1 - PEMISAHAN PELANGGARAN PRA-anchor vs PASCA-anchor.
+ *
+ * Pelanggaran PASCA-anchor = AKTIF (fail-closed, tidak berubah sedikit pun).
+ * Pelanggaran PRA-anchor = DIKECUALIKAN dari verdict aktif, tetapi TETAP dilaporkan pada
+ * `pre` - dikecualikan secara EKSPLISIT, bukan diabaikan diam-diam.
+ *
+ * @param array<int,string> $violations
+ * @param array<int,array<string,mixed>> $commits daftar commit (id + created_at)
+ * @return array{active:array<int,string>,pre:array<int,string>,anchor_changed:bool}
+ */
+function partitionViolationsByAnchor(array $violations, array $commits, ?array $anchor, int $cutoff): array
+{
+    $active = [];
+    $pre = [];
+    $atBySha = [];
+    foreach ($commits as $c) {
+        $id = (string) ($c['id'] ?? '');
+        if ($id !== '') {
+            $atBySha[strtolower($id)] = (string) ($c['created_at'] ?? '');
+        }
+    }
+    $shaTs = static function (string $label) use ($atBySha): int {
+        if (!preg_match('/([0-9a-f]{7,40})/i', $label, $m)) {
+            return -1;
+        }
+        $needle = strtolower($m[1]);
+        foreach ($atBySha as $id => $created) {
+            if (strpos($id, $needle) === 0) {
+                return $created !== '' ? (int) strtotime($created) : -1;
+            }
+        }
+        return -1;
+    };
+    foreach ($violations as $v) {
+        $v = (string) $v;
+        $ts = $shaTs($v);
+        if ($cutoff > 0 && $ts > 0 && $ts < $cutoff) {
+            $pre[] = $v;
+            continue;
+        }
+        $active[] = $v;
+    }
+    return [
+        'active' => $active,
+        'pre' => $pre,
+        'anchor_changed' => ($anchor !== null
+            && (string) ($anchor['reset_at'] ?? '') !== ''
+            && (string) ($anchor['sha'] ?? '') !== ''),
+    ];
+}
+
+// ---------------------------------------------------------------------------
 // Pengumpulan data
 // ---------------------------------------------------------------------------
 $glq = rawurlencode($glProject);
@@ -460,8 +626,6 @@ if (!is_array($commits)) {
     fwrite(STDERR, "ERROR: tidak bisa mengambil daftar commit GitLab (periksa --gl-project & token).\n");
     exit(EXIT_ERROR);
 }
-
-$cutoff = $POLICY['sample_days'] > 0 ? time() - ($POLICY['sample_days'] * 86400) : 0;
 
 // Ambil daftar commit mirror sekali (map short_sha -> sha).
 $mirrorMap = [];
@@ -1931,6 +2095,7 @@ $operationalErrors = 0;
 $vacuous = 0;  // commit tanpa dual-run (pipeline tak mencapai offload) — vakum, dilaporkan eksplisit
 $numericNA = [];  // dimensi paritas numerik yang belum terukur pada tahap ini (dilaporkan, bukan pelanggaran)
 $checked = 0;
+$anchorUndefined = 0;  // F1: commit yang TIDAK dinilai karena anchor diberikan tetapi tak terdefinisi
 
 foreach ($commits as $idx => $c) {
     if ($windowEnd !== null && $idx > $windowEnd) {
@@ -1938,6 +2103,13 @@ foreach ($commits as $idx => $c) {
     }
     $glSha = (string) ($c['id'] ?? '');
     if ($glSha === '') {
+        continue;
+    }
+    // F1: anchor yang DIBERIKAN tetapi TAK terdefinisi = jendela kualifikasi tidak sah.
+    //   Commit apa pun TIDAK boleh dinilai dari jendela longgar (fail-closed tegas:
+    //   dihitung ke `anchorUndefined` yang memaksa ERROR, bukan lulus diam-diam).
+    if ($windowMode === PARITY_WINDOW_UNDEFINED) {
+        $anchorUndefined++;
         continue;
     }
     $short = substr($glSha, 0, 8);
@@ -2274,10 +2446,28 @@ foreach ($commits as $idx => $c) {
 }
 
 // ---------------------------------------------------------------------------
+// F1 (WAVE 1) - PEMISAHAN PELANGGARAN PRA-anchor vs PASCA-anchor.
+//   Pelanggaran PASCA-anchor tetap KERAS (fail-closed, tidak dilunakkan).
+//   Pelanggaran PRA-anchor DIKECUALIKAN dari verdict aktif - tetapi tetap DILAPORKAN
+//   terpisah pada `excluded_pre_anchor_violations`, karena commit itu memang di luar
+//   jendela kualifikasi (mis. era insiden determinisme b80e14a7). Dikecualikan secara
+//   EKSPLISIT, bukan diabaikan diam-diam.
+// ---------------------------------------------------------------------------
+$preAnchorViolations = [];
+if ($cutoff > 0) {
+    $part = partitionViolationsByAnchor($violations, $commits, $anchor, $cutoff);
+    $violations = $part['active'];
+    $preAnchorViolations = $part['pre'];
+}
+
+// ---------------------------------------------------------------------------
 // Keluaran
 // ---------------------------------------------------------------------------
 // Verdict fail-closed: kesalahan operasional SELALU memaksa ERROR (exit 2), apa pun isinya.
 $verdict = $violations === [] ? 'PASS' : 'VIOLATION';
+if ($anchorUndefined > 0) {
+    $operationalErrors++;  // jendela kualifikasi tidak sah -> TIDAK boleh ditafsirkan lulus
+}
 if ($rows === []) {
     $operationalErrors++;
 }
@@ -2288,6 +2478,13 @@ if ($operationalErrors > 0) {
 if (!$compact) {
     echo "== Parity check (dual-run) ==\n";
     printf("  sampel: %d commit (branch %s, <= %d hari)\n", $checked, $branch, $POLICY['sample_days']);
+    printf(
+        "  jendela: mode=%s anchor=%s (defined=%s) cutoff=%s\n",
+        $windowMode,
+        (string) ($anchor['sha'] ?? '') !== '' ? substr((string) $anchor['sha'], 0, 12) : 'n/a',
+        ((bool) ($anchor['defined'] ?? false)) ? 'ya' : 'TIDAK',
+        $cutoff > 0 ? gmdate('c', $cutoff) : 'tanpa-batas'
+    );
     printf("  toleransi: line +-%.2f pp, branch +-%.2f pp, tests +-%d\n", $POLICY['line_tol'], $POLICY['branch_tol'], $POLICY['tests_tol']);
     echo "  ------------------------------------------------------------------\n";
     foreach ($rows as $r) {
@@ -2309,6 +2506,12 @@ if (!$compact) {
             echo "    - {$v}\n";
         }
     }
+    if ($preAnchorViolations !== []) {
+        printf("  Dikecualikan PRA-anchor (%d - di luar jendela kualifikasi, TIDAK diabaikan):\n", count($preAnchorViolations));
+        foreach ($preAnchorViolations as $v) {
+            echo "    - {$v}\n";
+        }
+    }
     if ($vacuous > 0) {
         echo "  Catatan: {$vacuous} commit TANPA dual-run (coverage-offload != success) → N/A, bukan lulus.\n";
     }
@@ -2327,9 +2530,29 @@ $summary = [
     'policy'        => $POLICY,
     'verdict'       => $verdict,
     'details'       => $violations,
+    'window_mode'   => $windowMode,
+    'anchor'        => [
+        'file'     => $anchorFile,
+        'source'   => $anchorMode,
+        'defined'  => (bool) ($anchor['defined'] ?? false),
+        'sha'      => (string) ($anchor['sha'] ?? ''),
+        'at'       => (string) ($anchor['at'] ?? ''),
+        'reset_at' => (string) ($anchor['reset_at'] ?? ''),
+    ],
+    'excluded_pre_anchor_violations' => $preAnchorViolations,
+    'pre_anchor_violations_count'    => count($preAnchorViolations),
+    'anchor_undefined_commits'       => $anchorUndefined,
 ];
 
-echo "== PARITY VERDICT: {$verdict} ({$checked} commit, " . count($violations) . " pelanggaran) ==\n";
+printf(
+    "== PARITY VERDICT: %s (%d commit, %d pelanggaran%s) window=%s anchor=%s ==\n",
+    $verdict,
+    $checked,
+    count($violations),
+    $preAnchorViolations !== [] ? ', ' . count($preAnchorViolations) . ' pra-anchor dikecualikan' : '',
+    $windowMode,
+    (string) ($anchor['sha'] ?? '') !== '' ? substr((string) $anchor['sha'], 0, 12) : 'n/a'
+);
 
 if (!$noWrite && $rows !== []) {
     if (!is_dir($outDir) && !@mkdir($outDir, 0775, true) && !is_dir($outDir)) {
@@ -3010,6 +3233,94 @@ function selftest(): int
     $ok('GateE-redy READY tidak mengubah hold.stage4=HOLD', (string) $eReady['hold']['stage4'] === 'HOLD');
     $ok('GateE-redy READY tidak mengubah cutover=NOT_APPROVED',
         (string) $eReady['hold']['canonical_cutover'] === 'NOT_APPROVED');
+
+    // -----------------------------------------------------------------------
+    // F1 (WAVE 1) - JENDELA PARITAS TERANCHOR: ACCEPTANCE TEST.
+    //   Empat kasus wajib: (a) pelanggaran PRA-anchor dikecualikan, (b) pelanggaran
+    //   PASCA-anchor tetap FAIL, (c) anchor tak terdefinisi -> fail-closed,
+    //   (d) anchor berubah -> kualifikasi ter-RESET.
+    // -----------------------------------------------------------------------
+    $anchorOkArr = ['defined' => true, 'sha' => str_repeat('d', 40),
+        'at' => '2026-09-12T22:29:00+00:00', 'reset_at' => '2026-09-12T22:29:00+00:00',
+        'reason' => 'uji', 'absent' => false];
+    $anchorNoneArr = ['defined' => false, 'sha' => '', 'at' => '', 'reset_at' => '', 'reason' => '', 'absent' => false];
+    $commitsMix = [
+        ['id' => str_repeat('a', 40), 'created_at' => '2026-09-12T21:00:00+00:00'], // PRA-anchor
+        ['id' => str_repeat('b', 40), 'created_at' => '2026-09-12T23:00:00+00:00'], // PASCA-anchor
+    ];
+
+    // (0) qualificationAnchor(): valid / SHA tak sah / berkas absen (fail-closed).
+    $tmpAnchor = tempnam(sys_get_temp_dir(), 'zefanchor');
+    file_put_contents($tmpAnchor, json_encode(['defined' => true, 'sha' => str_repeat('c', 40),
+        'at' => '2026-09-12T22:29:00+00:00', 'reset_at' => '2026-09-12T22:29:00+00:00']));
+    $aParsed = qualificationAnchor($tmpAnchor);
+    $ok('F1 qualificationAnchor(): anchor sah -> defined', $aParsed['defined'] === true && $aParsed['sha'] === str_repeat('c', 40));
+    file_put_contents($tmpAnchor, json_encode(['defined' => true, 'sha' => 'bukan-sha', 'at' => '2026-09-12T22:29:00+00:00']));
+    $ok('F1 qualificationAnchor(): SHA tak sah -> defined=false (fail-closed)', qualificationAnchor($tmpAnchor)['defined'] === false);
+    @unlink($tmpAnchor);
+    $aMissing = qualificationAnchor('/nonexistent/qualification-anchor.json');
+    $ok('F1 qualificationAnchor(): berkas absen -> absent=true & defined=false',
+        $aMissing['absent'] === true && $aMissing['defined'] === false);
+
+    // (0b) resolveWindowCutoff(): SATU batas jendela bagi KEDUA jalur.
+    [$cutAnchor, $modeAnchor] = resolveWindowCutoff($anchorOkArr, 14);
+    $ok('F1 resolveWindowCutoff(): anchor terdefinisi -> mode anchor + cutoff = waktu anchor',
+        $modeAnchor === PARITY_WINDOW_ANCHOR && $cutAnchor === (int) strtotime('2026-09-12T22:29:00+00:00'));
+    [$cutUndef, $modeUndef] = resolveWindowCutoff($anchorNoneArr, 14);
+    $ok('F1 resolveWindowCutoff(): anchor tak terdefinisi -> mode anchor-undefined + cutoff 0 (fail-closed)',
+        $modeUndef === PARITY_WINDOW_UNDEFINED && $cutUndef === 0);
+    [$cutAbsent, $modeAbsent] = resolveWindowCutoff(['defined' => false, 'sha' => '', 'at' => '', 'reset_at' => '', 'absent' => true], 14);
+    $ok('F1 resolveWindowCutoff(): berkas absen -> mundur ke sample-days (bukan kualifikasi)',
+        $modeAbsent === PARITY_WINDOW_SAMPLE && $cutAbsent > 0);
+    [$cutRaw, $modeRaw] = resolveWindowCutoff(null, 14);
+    $ok('F1 resolveWindowCutoff(): tanpa --anchor-file -> sample-days (perilaku lama utuh)',
+        $modeRaw === PARITY_WINDOW_SAMPLE && $cutRaw > 0);
+
+    // (a) Pelanggaran PRA-anchor DIKECUALIKAN dari kualifikasi (tetapi tetap dilaporkan).
+    $violMix = ['P8 aaaaaaaa: run GitHub=failure tetapi status GitLab=success',
+                'P8 bbbbbbbb: run GitHub=failure tetapi status GitLab=success'];
+    $partA = partitionViolationsByAnchor($violMix, $commitsMix, $anchorOkArr, $cutAnchor);
+    $ok('F1 (a) pelanggaran PRA-anchor dikecualikan dari verdict aktif',
+        count($partA['pre']) === 1 && strpos($partA['pre'][0], 'aaaaaaaa') !== false);
+    $ok('F1 (a) pelanggaran pra-anchor TETAP dilaporkan (tidak diabaikan diam-diam)',
+        count($partA['pre']) === 1 && $partA['pre'] !== []);
+    $ok('F1 (a) pelanggaran PASCA-anchor tetap aktif (tidak ikut dikeluarkan)',
+        count($partA['active']) === 1 && strpos($partA['active'][0], 'bbbbbbbb') !== false);
+
+    // (b) Pelanggaran PASCA-anchor saja -> TETAP FAIL (fail-closed tidak dilunakkan).
+    $partB = partitionViolationsByAnchor(['P8 bbbbbbbb: mismatch'], $commitsMix, $anchorOkArr, $cutAnchor);
+    $ok('F1 (b) pelanggaran PASCA-anchor -> verdict aktif (VIOLATION), bukan dikecualikan',
+        count($partB['active']) === 1 && $partB['pre'] === []);
+
+    // (c) Anchor tak terdefinisi -> jendela TIDAK sah: cutoff 0 + mode fail-closed.
+    $partC = partitionViolationsByAnchor($violMix, $commitsMix, $anchorNoneArr, $cutUndef);
+    $ok('F1 (c) anchor tak terdefinisi -> TIDAK ada pelanggaran yang dikecualikan (cutoff 0)',
+        $partC['pre'] === []);
+
+    // (d) Anchor BERUBAH (reset) -> commit yang dulu PASCA-anchor menjadi PRA-anchor baru.
+    $anchorNewArr = ['defined' => true, 'sha' => str_repeat('e', 40),
+        'at' => '2026-09-12T23:30:00+00:00', 'reset_at' => '2026-09-12T23:30:00+00:00',
+        'reason' => 'reset uji', 'absent' => false];
+    [$cutNew] = resolveWindowCutoff($anchorNewArr, 14);
+    $partDold = partitionViolationsByAnchor($violMix, $commitsMix, $anchorOkArr, $cutAnchor);
+    $partDnew = partitionViolationsByAnchor($violMix, $commitsMix, $anchorNewArr, $cutNew);
+    $ok('F1 (d) anchor di-RESET -> kualifikasi dihitung ulang dari anchor baru', $cutNew > $cutAnchor);
+    $ok('F1 (d) reset anchor -> pelanggaran yang dulu aktif kini dikecualikan (keranjang direset)',
+        count($partDold['active']) === 1 && count($partDnew['active']) === 0 && count($partDnew['pre']) === 2);
+    $ok('F1 (d) partition menandai anchor berubah (reset_at + sha terisi)',
+        $partDnew['anchor_changed'] === true);
+    $ok('F1 (d) tanpa anchor -> partition TIDAK mengklaim anchor berubah',
+        partitionViolationsByAnchor([], [], null, 0)['anchor_changed'] === false);
+
+    // (e) GUARD REGRESI: observer WAJIB memakai jendela teranchor (satu sumber).
+    $ciPathF1 = dirname(__DIR__, 2) . '/.gitlab-ci.yml';
+    if (is_file($ciPathF1)) {
+        $ciF1 = (string) file_get_contents($ciPathF1);
+        $ok('F1 guard: observer memakai --anchor-file (jendela teranchor, bukan --max saja)',
+            strpos($ciF1, '--anchor-file=') !== false);
+        $ok('F1 guard: observer memakai --require-anchor (anchor hilang = ERROR, bukan jendela longgar)',
+            strpos($ciF1, '--require-anchor') !== false);
+    }
 
     // -----------------------------------------------------------------------
     // Gate F hardening (#39) - GUARD REGRESI pada PEMBUNGKUS SHELL observer.
